@@ -172,6 +172,12 @@ extern "C" void tud_resume_cb(void) {
     host_suspended = false;
     host_resumed_event = true;
     suspend_at_us = 0;   // resumed before the debounce elapsed -> cancel the disconnect
+
+#if !ENABLE_SERIAL
+    if (!get_config().enable_wake && !bt_is_connected()) {
+        tud_disconnect();
+    }
+#endif
 }
 
 extern "C" void tud_mount_cb(void) {
@@ -180,6 +186,14 @@ extern "C" void tud_mount_cb(void) {
     host_resumed_event = true;
     suspend_at_us = 0;
     reconnect_until_us = 0;   // reconnect finished re-enumerating; end the grace early
+
+    // Disconnect the ghost device when the PC resumes.
+    // If USB keep-charging is enabled, the PC may show a ghost device after startup/resume.
+#if !ENABLE_SERIAL
+    if (!get_config().enable_wake && !bt_is_connected()) {
+        tud_disconnect();
+    }
+#endif
 }
 
 void wake_on_bt_input(const uint8_t *hid_input, uint16_t len) {
