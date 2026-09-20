@@ -27,6 +27,24 @@ struct __attribute__((packed)) Config_body {
     uint8_t lock_volume; // bool
     uint8_t status_gpio_pin; // board-usable GPIO, 0xff: disabled
     uint8_t status_gpio_mode; // 0: high while connected, 1: button pulse on connect
+    // ---- 以下为 OLED Edition 特有字段（上游没有；一律追加在末尾，别插到上面去）----
+    uint8_t current_slot;    // [0..3] 当前多槽位配对槽（Phase G）
+    // Audio Auto Haptics：从扬声器音频派生的触觉（DSP 借自 loteran/DS5Dongle 5d6bc2f）
+    uint8_t auto_haptics_enable;  // 0=Off, 1=Fallback (default), 2=Mix, 3=Replace
+    uint8_t auto_haptics_gain;    // [0,200] percent, default 100
+    uint8_t auto_haptics_lowpass; // 0=80Hz, 1=160Hz (default), 2=250Hz, 3=400Hz
+    // Lightbar：灯条模式/收藏色（编号与 oled.cpp 的 kNumLbModes/kLbModeHost 同步）
+    uint8_t lightbar_mode;
+    uint8_t lb_fav_r[4];
+    uint8_t lb_fav_g[4];
+    uint8_t lb_fav_b[4];
+    // OLED 空闲熄屏阶梯（分钟，0 = 该级禁用）
+    uint8_t screen_dim_timeout;
+    uint8_t screen_off_timeout;
+    // OLED 亮度档（kBrightLevels 下标）
+    uint8_t screen_brightness;
+    // 0 = 手柄输入不再唤醒 OLED（只有 OLED 自己的按键会）
+    uint8_t controller_wakes_display;
 };
 
 struct __attribute__((packed)) Config {

@@ -1,9 +1,10 @@
 name: Build firmware (reusable)
 
 # Reusable build used by build.yml and release.yml.
-# Builds enabled firmware variants through a matrix. Standard/debug always run;
-# Pico W, Waveshare and no-batt-led compile checks are optional. When
-# `upload_tag` is set, the standard UF2 and other-board ZIP are attached to
+# Builds enabled firmware variants through a matrix. Standard/debug and the
+# wake-hid compile check always run; Pico W, Waveshare and no-batt-led compile
+# checks are optional. When `upload_tag` is set, the standard UF2 and
+# other-board ZIP are attached to
 # that GitHub Release.
 
 on:
@@ -54,8 +55,10 @@ env:
   PICO_SDK_REF: 2.3.0
   TINYUSB_REF: 2d56dc533e45e4e91b15e93fdab5e22e964f328d
   PICO_SDK_PATH: ${{ github.workspace }}/pico-sdk
-  ARM_TOOLCHAIN_VERSION: 15.2.rel1
-  ARM_TOOLCHAIN_URL: https://gitlab.arm.com/api/v4/projects/tooling%2Fgnu-toolchains-for-arm/packages/generic/gnu-toolchain/15.2.rel1/arm-gnu-toolchain-15.2.rel1-x86_64-arm-none-eabi.tar.xz
+  # OLED Edition: 钉在 13.2.rel1 —— 本地验证可用的版本；15.2 编出的固件在本硬件上
+  # USB 枚举失败（设备描述符阶段），根因未定位，暂不用。上游更新若改回 15.2，保留本行。
+  ARM_TOOLCHAIN_VERSION: 13.2.rel1
+  ARM_TOOLCHAIN_URL: https://developer.arm.com/-/media/Files/downloads/gnu/13.2.rel1/binrel/arm-gnu-toolchain-13.2.rel1-x86_64-arm-none-eabi.tar.xz
   ARM_TOOLCHAIN_PATH: ${{ github.workspace }}/arm-toolchain
   APT_PACKAGES: >-
     cmake
@@ -98,6 +101,18 @@ jobs:
                   "build_dir": "debug",
                   "cmake_args": "-DENABLE_SERIAL=ON -DENABLE_VERBOSE=ON -DWAKE_DEBUG=ON",
                   "artifact": "ds5-bridge-debug",
+                  "upload_artifact": True,
+              },
+              {
+                  # -DENABLE_WAKE_HID=ON：上游 wake-on-PS / Game Bar 全功能的持续编译
+                  # 检查（默认关闭的宏路径必须每次构建，否则会悄悄烂掉）。该变体
+                  # HID 数量 = 2、DS5 描述符不再逐字节一致；想实机体验上游 wake
+                  # 功能时可直接刷这个 artifact。
+                  "id": "wake-hid",
+                  "name": "Wake-HID firmware (ENABLE_WAKE_HID=ON)",
+                  "build_dir": "wake-hid",
+                  "cmake_args": "-DENABLE_WAKE_HID=ON",
+                  "artifact": "ds5-bridge-wake-hid",
                   "upload_artifact": True,
               },
           ]

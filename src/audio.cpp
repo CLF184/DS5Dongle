@@ -23,7 +23,10 @@
 #include "pico/multicore.h"
 #include "pico/flash.h"
 #include "pico/util/queue.h"
+#include "pico/time.h"
+#include "pico/platform.h"
 #include "config.h"
+#include "auto_haptics.h"
 
 #define INPUT_CHANNELS    4
 #define OUTPUT_CHANNELS   2
@@ -73,6 +76,59 @@ struct haptics_element {
     uint8_t data[64];
 };
 
+// Mic diag counters surfaced on the OLED Diagnostics screen / web emulator
+// (defined here with the decoder; guarded by our own accessors in audio.h).
+static OpusDecoder *mic_decoder = nullptr; // created + owned by core1 (mic_proc)
+static volatile uint32_t g_mic_frames = 0;
+static volatile int32_t  g_mic_last_decoded = 0;  // opus_decode return value (core1)
+static volatile uint16_t g_mic_last_want = 0;     // bytes we asked TinyUSB to send
+static volatile uint16_t g_mic_last_wrote = 0;    // bytes TinyUSB accepted
+uint32_t audio_mic_frames() { return g_mic_frames; }
+int32_t  audio_mic_last_decoded() { return g_mic_last_decoded; }
+uint16_t audio_mic_last_want()    { return g_mic_last_want; }
+uint16_t audio_mic_last_wrote()   { return g_mic_last_wrote; }
+static volatile uint32_t g_mic_decode_failures = 0;  // opus_decode returns <= 0 (bad/missing packets)
+uint32_t audio_mic_decode_failures() { return g_mic_decode_failures; }
+
+// Monotonic byte-flow counters for the OLED Diagnostics screen and the web
+// emulator's USB / BT rate display. Updated below.
+static volatile uint32_t g_usb_frames = 0;
+static volatile uint32_t g_bt_packets = 0;
+uint32_t audio_usb_frames() { return g_usb_frames; }
+uint32_t audio_bt_packets() { return g_bt_packets; }
+
+// Rolling-peak meters for the OLED VU screen. Updated in audio_loop once per USB
+// frame (written by core1, read by core0 — hence volatile).
+//
+// The release is a pure function of elapsed time (~256 ms to zero) instead of
+// "12.5 % per read". Decay-on-read meant a stale peak sat frozen while nobody was looking
+// at the meter — the VU screen opened showing a spike from minutes ago — and every
+// extra reader (the web emulator's 0xFB diag payload reads these too) silently
+// doubled the fall rate. Now the value on screen is decay(stored peak, age), so it
+// expires on its own and all readers see the same number.
+static volatile uint16_t g_peak_spk   = 0;
+static volatile uint16_t g_peak_hap   = 0;
+static volatile uint32_t g_peak_spk_t = 0;  // µs when g_peak_spk was recorded
+static volatile uint32_t g_peak_hap_t = 0;
+
+// Linear release: ~1/256 less per ~1 ms unit, fully released at ~256 ms —
+// anything older reads 0, so a peak cannot survive a page that was left closed.
+// Integer only (no divide): a shift, a multiply, a shift. The u >= 256 guard is
+// what keeps the subtraction from going negative (and wrapping in the uint16).
+static inline uint16_t peak_decay(uint16_t v, uint32_t dt_us) {
+    const uint32_t u = dt_us >> 10;                 // ~1 ms units
+    if (u >= 256u) return 0;                        // ≥ ~256 ms old → fully released
+    return (uint16_t)(v - (uint32_t)v * u / 256u);  // u < 256 → never negative
+}
+
+uint8_t audio_peak_speaker() {
+    return (uint8_t)(peak_decay(g_peak_spk, time_us_32() - g_peak_spk_t) >> 7);
+}
+uint8_t audio_peak_haptic() {
+    return (uint8_t)(peak_decay(g_peak_hap, time_us_32() - g_peak_hap_t) >> 7);
+}
+
+
 void set_headset(bool state) {
     plug_headset = state;
 }
@@ -97,6 +153,26 @@ void update_mic_status() {
     pkt[3] = 1;
     pkt[4] = (mic_active && get_config().mic_select != 3) ? 0b00000011 : 0b00000010;
     bt_write(pkt, sizeof(pkt));
+}
+
+// Re-assert the DS5 mic-enable (pkt[4] bit 0 of the 0x32 status packet) roughly
+// 4x/sec while the host is recording but no mic frames have arrived yet. The
+// enable is sticky, so this only runs until the stream starts (then it stops,
+// saving BT traffic + DS5 battery) and resumes if the stream stalls. Mirrors the
+// OLED Edition fix: without it, mic only works while something also plays audio
+// (the enable otherwise only rides the audio packets, which need 2+2 queued frames).
+static void mic_enable_keepalive() {
+    if (!bt_is_connected() || get_config().mic_select == 3 || !mic_active) return;
+    const uint64_t now = time_us_64();
+    static uint32_t last_frames = 0;
+    static uint64_t last_frame_us = 0;
+    static uint64_t last_send_us = 0;
+    const uint32_t frames = g_mic_frames;
+    if (frames != last_frames) { last_frames = frames; last_frame_us = now; }
+    if (last_frame_us != 0 && (now - last_frame_us) < 1000000ULL) return; // streaming -> sticky
+    if (last_send_us != 0 && (now - last_send_us) < 250000ULL) return;    // ~4 Hz while arming
+    last_send_us = now;
+    update_mic_status();
 }
 
 void __not_in_flash_func(audio_bt_task)() {
@@ -171,6 +247,7 @@ void __not_in_flash_func(audio_bt_task)() {
     }
 #endif
     bt_write(pkt, sizeof(pkt));
+    g_bt_packets++;
 }
 
 void __not_in_flash_func(audio_loop)() {
@@ -254,11 +331,14 @@ void __not_in_flash_func(audio_loop)() {
                     }
                 }
 
-                tud_audio_write(usb_tx_buf, sizeof(usb_tx_buf));
+                const uint16_t wrote = tud_audio_write(usb_tx_buf, sizeof(usb_tx_buf));
+                g_mic_last_want  = (uint16_t) sizeof(usb_tx_buf);
+                g_mic_last_wrote = wrote;
                 active_frame_offset += samples_needed;
 
                 if (active_frame_offset >= total_samples) {
                     has_active_frame = false; // Current frame completely drained
+                    g_mic_frames++;
                 }
             }
         }
@@ -269,7 +349,14 @@ void __not_in_flash_func(audio_loop)() {
     audio_bt_task();
 
     // 1. 读取 USB 音频数据
-    if (!tud_audio_available()) return;
+    if (!tud_audio_available()) {
+        // Keep the DS5 mic streaming even without output audio — but ONLY once the
+        // host has enumerated us (tud_mounted). Running it during the fresh-pair
+        // feature handshake floods BT TX and delays controller-type detection past
+        // the connection watchdog's timeout (~10-15s "shutdown" on fresh pair).
+        if (tud_mounted()) mic_enable_keepalive();
+        return;
+    }
 
     int16_t raw[192];
     uint32_t bytes_read = tud_audio_read(raw, sizeof(raw)); // 每次读入 384 bytes
@@ -277,13 +364,19 @@ void __not_in_flash_func(audio_loop)() {
     if (frames == 0) {
         return;
     }
+    g_usb_frames += (uint32_t) frames;
 
     static float audio_buf[512 * 2];
     static uint audio_buf_pos = 0;
     WDL_ResampleSample *in_buf;
     int nframes = resampler.ResamplePrepare(frames, OUTPUT_CHANNELS, &in_buf);
 
-    // const float audio_gain = mute[0] ? 0.0f : powf(10.0f, get_config().speaker_volume / 20.0f);
+    // OLED 音量（Spk Vol）走软件增益 —— fork 的原有做法（上游没有这个菜单，这行在他们那儿
+    // 是注释的）。字段与上游同单位（[0,127]，100 = 0dB），这里换算成线性增益；主机静音时归零。
+    // 主机自己的音量走另一条路（SET_CUR → 0x32 推给手柄），两条互不干扰 —— 与 fork 一致。
+    extern uint8_t mute[2]; // usb.cpp 定义（主机 SET_CUR 的静音状态）
+    const float audio_gain = mute[0] ? 0.0f
+                                     : powf(10.0f, ((int) cfg.speaker_volume - 100) / 20.0f);
     const float haptics_gain = cfg.haptics_gain;
 #if !DISABLE_SPEAKER_PROC
     if (!speaker_enabled) {
@@ -292,11 +385,40 @@ void __not_in_flash_func(audio_loop)() {
         }
     }
 #endif
+    // Peak meters: start from the *decayed* stored peak (not the raw stored one),
+    // so a new, smaller peak can still take over once the old big one has aged out.
+    const uint32_t peak_now = time_us_32();
+    const uint16_t peak_base_spk = peak_decay(g_peak_spk, peak_now - g_peak_spk_t);
+    const uint16_t peak_base_hap = peak_decay(g_peak_hap, peak_now - g_peak_hap_t);
+    uint16_t spk_max = peak_base_spk;
+    uint16_t hap_max = peak_base_hap;
+    uint16_t native_max = 0;  // 本帧 ch3/ch4 实际峰值（Fallback 静默判断用，不继承 VU 显示缓存）
+
+    // ---- Audio Auto Haptics（实现见 auto_haptics.cpp；sample() 头内联保热路径）----
+    g_auto_haptics.begin();
     for (int i = 0; i < nframes; i++) {
+        // VU peak tracking
+        {
+            int16_t sl = raw[i * INPUT_CHANNELS];
+            int16_t sr = raw[i * INPUT_CHANNELS + 1];
+            int16_t hl = raw[i * INPUT_CHANNELS + 2];
+            int16_t hr = raw[i * INPUT_CHANNELS + 3];
+            uint16_t a = (uint16_t)(sl < 0 ? -sl : sl);
+            uint16_t b = (uint16_t)(sr < 0 ? -sr : sr);
+            if (a > spk_max) spk_max = a;
+            if (b > spk_max) spk_max = b;
+            a = (uint16_t)(hl < 0 ? -hl : hl);
+            b = (uint16_t)(hr < 0 ? -hr : hr);
+            if (a > hap_max) hap_max = a;
+            if (b > hap_max) hap_max = b;
+            if (a > native_max) native_max = a;
+            if (b > native_max) native_max = b;
+        }
+
 #if !DISABLE_SPEAKER_PROC
         if (speaker_enabled) {
-            audio_buf[audio_buf_pos++] = raw[i * INPUT_CHANNELS] / 32768.0f;
-            audio_buf[audio_buf_pos++] = raw[i * INPUT_CHANNELS + 1] / 32768.0f;
+            audio_buf[audio_buf_pos++] = raw[i * INPUT_CHANNELS] / 32768.0f * audio_gain;
+            audio_buf[audio_buf_pos++] = raw[i * INPUT_CHANNELS + 1] / 32768.0f * audio_gain;
             if (audio_buf_pos == 512 * 2) {
                 static audio_raw_element element{};
                 memcpy(element.data, audio_buf, 512 * 2 * 4);
@@ -310,10 +432,21 @@ void __not_in_flash_func(audio_loop)() {
             }
         }
 #endif
+        // 上游 a55fd46：haptics 增益改到重采样之后再施加（见下面的 int8 转换）。
+        float h_l = raw[i * INPUT_CHANNELS + 2] / 32768.0f;
+        float h_r = raw[i * INPUT_CHANNELS + 3] / 32768.0f;
 
-        in_buf[i * 2] = raw[i * INPUT_CHANNELS + 2]  / 32768.0f;
-        in_buf[i * 2 + 1] = raw[i * INPUT_CHANNELS + 3]  / 32768.0f;
+        g_auto_haptics.sample(raw[i * INPUT_CHANNELS] / 32768.0f,
+                              raw[i * INPUT_CHANNELS + 1] / 32768.0f, h_l, h_r);
+
+        in_buf[i * 2]     = static_cast<WDL_ResampleSample>(clamp(h_l, -1.0f, 1.0f));
+        in_buf[i * 2 + 1] = static_cast<WDL_ResampleSample>(clamp(h_r, -1.0f, 1.0f));
     }
+    // 只有真的出现更高峰值才刷新（并盖时间戳）；否则保持原值+原时间戳不动，
+    // 让它按年龄自然过期——避免"旧的大峰值"永久压制后续的小峰值。
+    if (spk_max > peak_base_spk) { g_peak_spk = spk_max; g_peak_spk_t = peak_now; }
+    if (hap_max > peak_base_hap) { g_peak_hap = hap_max; g_peak_hap_t = peak_now; }
+    g_auto_haptics.end(native_max);
 
     // 3. 48kHz -> 3kHz 重采样
     static WDL_ResampleSample out_buf[SAMPLE_SIZE]; // 64 floats = 32帧 × 2ch
@@ -440,7 +573,9 @@ static void __not_in_flash_func(mic_proc)() {
     }
     static mic_decode_element decode_element{};
     auto decoded_samples = opus_decode(decoder, mic_packet.data, MIC_OPUS_SIZE, decode_element.data, MIC_FRAMES, false);
+    g_mic_last_decoded = decoded_samples;
     if (decoded_samples <= 0) {
+        g_mic_decode_failures++;
         // Gated behind ENABLE_VERBOSE: printf pulls the newlib formatting chain
         // (flash) onto core1's path. Release builds compile it out so core1's
         // audio loop stays fully RAM-resident (no XIP fetches on this core).

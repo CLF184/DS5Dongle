@@ -68,12 +68,14 @@ void config_valid() {
         body->config_version = CONFIG_VERSION;
         printf("[Config] Warning: Config may breaking change. Reset to default\n");
     }
+    // ---- 共享字段：按上游的顺序与写法排列（rebase 友好）。仅两处默认值按 fork 需要
+    //      偏离：speaker_gain 用 0（=auto，不强制预增益）、enable_usb_sn 用 1（带序列号）。----
     if (std::isnan(body->haptics_gain) || body->haptics_gain < 1.0f || body->haptics_gain > 2.0f) {
         body->haptics_gain = 1.0f;
         printf("[Config] Haptics Gain value is invalid\n");
     }
     if (body->speaker_volume > 127) {
-        body->speaker_volume = 100;
+        body->speaker_volume = 100; // 100 = 0dB
         printf("[Config] Speaker Volume is invalid\n");
     }
     if (body->headset_volume > 127) {
@@ -81,10 +83,10 @@ void config_valid() {
         printf("[Config] Headset Volume is invalid\n");
     }
     if (body->speaker_gain > 7) {
-        body->speaker_gain = 2;
+        body->speaker_gain = 0; // fork: 0 = auto（上游默认 2）
         printf("[Config] speaker_gain is invalid\n");
     }
-    if (body->inactive_time > 60) {
+    if (body->inactive_time > 60) { // 0 = 关闭空闲自动断开（上游语义）
         body->inactive_time = 30;
         printf("[Config] Inactive time is invalid\n");
     }
@@ -105,7 +107,7 @@ void config_valid() {
         printf("[Config] controller_mode is invalid\n");
     }
     if (body->enable_usb_sn > 1) {
-        body->enable_usb_sn = 0;
+        body->enable_usb_sn = 1; // fork: 默认带序列号（上游默认 0）
         printf("[Config] Warning: enable_usb_sn is invalid\n");
     }
     if (body->ps_shortcut_enabled > 1) {
@@ -140,6 +142,45 @@ void config_valid() {
         body->status_gpio_mode = 0;
         printf("[Config] status_gpio_mode is invalid\n");
     }
+    // ---- 以下为 OLED Edition 特有字段（追加块）----
+    if (body->current_slot >= 4) {
+        body->current_slot = 0;
+        printf("[Config] current_slot is invalid\n");
+    }
+    if (body->auto_haptics_enable > 3) {
+        body->auto_haptics_enable = 1; // Fallback default
+        printf("[Config] auto_haptics_enable invalid, defaulting to 1 (Fallback)\n");
+    }
+    if (body->auto_haptics_gain > 200) {
+        body->auto_haptics_gain = 100;
+        printf("[Config] auto_haptics_gain invalid, defaulting to 100\n");
+    }
+    if (body->auto_haptics_lowpass > 3) {
+        body->auto_haptics_lowpass = 1; // 160 Hz
+        printf("[Config] auto_haptics_lowpass invalid, defaulting to 1 (160 Hz)\n");
+    }
+    if (body->lightbar_mode > 8) { // 0..7 OLED modes + 8 = HOST passthrough (default)
+        body->lightbar_mode = 8;
+        printf("[Config] lightbar_mode invalid, defaulting to 8 (HOST passthrough)\n");
+    }
+    // lb_fav_{r,g,b} need no validation — any 0..255 is a legal color, and an
+    // erased flash sector (0xFF) yields 4 white favorites, a usable default.
+    if (body->screen_dim_timeout > 250) { // 0xFF erased / out of range → default
+        body->screen_dim_timeout = 2;     // mirrors the original 2-min dim tier
+        printf("[Config] screen_dim_timeout invalid, defaulting to 2 min\n");
+    }
+    if (body->screen_off_timeout > 250) {
+        body->screen_off_timeout = 15;    // mirrors the original 15-min off tier
+        printf("[Config] screen_off_timeout invalid, defaulting to 15 min\n");
+    }
+    if (body->screen_brightness > 3) {    // kBrightLevels has 4 entries (0..3)
+        body->screen_brightness = 0;      // full brightness
+        printf("[Config] screen_brightness invalid, defaulting to 0 (full)\n");
+    }
+    if (body->controller_wakes_display > 1) { // 0xFF erased / upgrade → default ON
+        body->controller_wakes_display = 1;
+        printf("[Config] controller_wakes_display invalid, defaulting to 1 (on)\n");
+    }
 }
 
 void config_load() {
@@ -148,11 +189,20 @@ void config_load() {
     config_valid();
 }
 
+// Reset RAM-resident config body to firmware defaults. Caller must
+// config_save() to persist. Filling with 0xFF mirrors the byte pattern
+// of a freshly-erased flash sector, so every field fails validity and
+// gets re-initialized to its documented default by config_valid().
+void config_default() {
+    memset(&config.body, 0xFF, sizeof(config.body));
+    config_valid();
+}
+
 // Runs with core1 parked (flash_safe_execute) and core0 interrupts disabled, so
 // neither core touches XIP flash while the sector is erased/programmed. Without
 // the core1 park this races the audio core and corrupts audio (buzzing).
 static void config_save_flash_op(void *param) {
-    const auto *page = static_cast<const uint8_t *>(param);
+    const auto page = static_cast<const uint8_t *>(param);
     const uint32_t interrupts = save_and_disable_interrupts();
     flash_range_erase(CONFIG_FLASH_OFFSET, FLASH_SECTOR_SIZE);
     flash_range_program(CONFIG_FLASH_OFFSET, page, FLASH_PAGE_SIZE);

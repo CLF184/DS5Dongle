@@ -33,6 +33,15 @@ void usb_reconnect(bool keyboard_only) {
     tud_connect();
 }
 
+#ifndef ENABLE_WAKE_HID // 与 wake.cpp 的同名回调互斥（上游也是这个结构）
+// 设备重新枚举完成后清掉"重配置中"标志。上游把这一步放在 wake.cpp 的 FSM 里
+// (tud_mount_cb)，而本固件不编译 wake——不在这里兜底的话，usb_reconnect()
+// （web 工具 0x03 指令 / wake 关闭时的重挂载）之后 interrupt_loop 的 HID 上报
+// 会因这道门永久停摆：手柄能被系统认到，但一切输入/灯条/震动都不动。
+extern "C" void tud_mount_cb(void) {
+    usb_reconfiguring = false;
+}
+#endif // !ENABLE_WAKE_HID
 uint8_t mute[2] = {}; // 0: SPEAKER(0x02) 1: MIC(0x05)
 float volume[2] = {0.0f,48.0f}; // 0: SPEAKER(0x02) 1: MIC(0x05)
 
@@ -237,12 +246,23 @@ void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_
     (void) len;
 }
 
-#ifndef ENABLE_WAKE_HID
-
+#ifndef ENABLE_WAKE_HID // 与 wake.cpp 的同名回调互斥。注意：上游恒定义 ENABLE_WAKE_HID，
+                       // 这个分支上游从不参与编译（死代码）；本构建是它唯一真实用户——
+                       // wake.cpp 正常提供的 resume/mount 回调在这里补齐（见下方注释）。
 void tud_suspend_cb(bool remote_wakeup_en) {
+    (void) remote_wakeup_en;
     printf("[USB PM] invoke tud_suspend_cb\n");
     if (!get_config().enable_wake) return;   // wake off: leave the controller's BT alone on a USB suspend (see wake.cpp)
     bt_disconnect();
 }
 
+// 上游 edec7f7 的"幽灵设备"修复（wake.cpp 在 wake 构建里提供同名回调；本构建在此补齐）：
+// 唤醒时若手柄没连上，主动断 USB 让主机重新枚举。
+void tud_resume_cb(void) {
+#if !ENABLE_SERIAL
+    if (!bt_is_connected()) {
+        tud_disconnect();
+    }
 #endif
+}
+#endif // !ENABLE_WAKE_HID

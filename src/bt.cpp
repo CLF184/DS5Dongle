@@ -14,6 +14,7 @@
 #include "gap.h"
 #include "l2cap.h"
 #include "pico/cyw43_arch.h"
+#include "pico/platform.h"
 #include "utils.h"
 #include "bsp/board_api.h"
 #include "classic/sdp_server.h"
@@ -30,9 +31,19 @@
 #if PICO_RP2350
 #include "hardware/regs/sio.h"
 #endif
+#include "slots.h"
 
 #define MTU_CONTROL 672
 #define MTU_INTERRUPT 672
+
+// Connection-attempt watchdog: if a connection commits to a device (inquiry
+// found one / incoming request accepted) but doesn't reach USB-enumeration
+// within this window, tear down and retry. Catches the silent stalls caused by
+// USB 3.0 2.4 GHz RF interference on the CYW43 BT radio (DualSense stuck on the
+// amber init lightbar, never enumerates) — see README troubleshooting. A
+// healthy or slow re-pair finishes well under 6 s, so 10 s never trips a real
+// connection but heals before the user reaches to replug.
+#define CONNECT_WATCHDOG_TIMEOUT_US (10 * 1000 * 1000)
 
 using std::unordered_map;
 using std::vector;
@@ -81,6 +92,9 @@ struct send_element {
 
 absolute_time_t inactive_time = 0; // 手柄长时间静默
 
+// 0x81 回执配对：读时每发一次查询，用它的变化判断"本次回执已到"（见 get_feature_data）。
+static volatile uint32_t g_report81_seq = 0;
+
 const uint8_t state_init_data[66] = {
     0xa2, 0x31, 0x01,
     0x7f, 0x7d, 0x7f, 0x7e, 0x00, 0x00, 0xa7,
@@ -93,9 +107,21 @@ const uint8_t state_init_data[66] = {
     0x53, 0x9f, 0x28, 0x35, 0xa5, 0xa8, 0x0c, 0x8b
 };
 
+// Connection-attempt watchdog timestamp. 0 == not armed; armed == a connection
+// attempt is in flight (committed to a device, not yet USB-enumerating). Set
+// when an attempt begins, cleared the instant the controller type is identified
+// (USB connects) and on every teardown. Checked by bt_connection_watchdog_tick().
+static absolute_time_t connect_attempt_started = 0;
+
 void bt_register_data_callback(bt_data_callback_t callback) {
     bt_data_callback = callback;
 }
+
+// ---- OLED add-on accessors（槽位 API 已搬到 slots.cpp） --------------------------------
+
+void bt_get_addr(uint8_t out[6]) { memcpy(out, current_device_addr, 6); }
+
+uint32_t bt_hci_err_count() { return 0; }  // stub for OLED Diagnostics
 
 void bt_send_packet(uint8_t *data, uint16_t len) {
     if (hid_interrupt_cid != 0) {
@@ -124,16 +150,69 @@ bool bt_is_connected() {
     return hid_interrupt_cid != 0;
 }
 
+// Called every main-loop iteration. If a connection attempt has stalled past
+// the timeout, tear it down so the state machine retries instead of hanging
+// (e.g. on the amber lightbar under USB 3.0 RF interference). Inert unless a
+// connection attempt is in flight, so it never touches a healthy session.
+void bt_connection_watchdog_tick() {
+    if (connect_attempt_started == 0) return; // not armed
+    if (absolute_time_diff_us(connect_attempt_started, get_absolute_time())
+            < CONNECT_WATCHDOG_TIMEOUT_US) {
+        return;
+    }
+    printf("[BT] Connection watchdog: attempt stalled, recovering\n");
+    connect_attempt_started = 0; // disarm; the next attempt re-arms
+
+    if (acl_handle != HCI_CON_HANDLE_INVALID) {
+        // ACL is up but setup stalled (auth/encryption/L2CAP/feature-wait).
+        // Route through the proven HCI_EVENT_DISCONNECTION_COMPLETE teardown.
+        bt_disconnect();
+    } else {
+        // No ACL yet (stalled before/at create-connection) — reset by hand
+        // and kick a fresh inquiry.
+        device_found = false;
+        new_pair = false;
+        gap_inquiry_stop();
+        gap_inquiry_start(30);
+        gap_connectable_control(1);
+        slots_update_discoverable();
+    }
+}
+
+// Pure getter: returns the last measured RSSI. Refreshing is a separate,
+// explicit request (bt_rssi_request) so that *reading* never changes anything —
+// the previous read-triggers-a-command design made the HCI traffic depend on how
+// many readers existed and how fast each of them polled.
 void bt_get_signal_strength(int8_t *rssi) {
-    // gap_read_rssi() completes asynchronously, so this function can only
-    // return the last cached RSSI value. Trigger a refresh afterwards so a
-    // subsequent call can observe the updated value once the RSSI event arrives.
     if (rssi != nullptr) {
         *rssi = bt_rssi;
     }
-    if (acl_handle != HCI_CON_HANDLE_INVALID) {
-        gap_read_rssi(acl_handle);
+}
+
+// Ask for a fresh RSSI. The rate is owned here, not by the callers: at most one
+// request in flight, and at most one per RSSI_REFRESH_INTERVAL_US. Callers only
+// express intent — the OLED RSSI screen calls this every render (~10 Hz) and the
+// web payload once per request; neither can push the HCI rate past the cap.
+static bool rssi_read_pending = false;
+static absolute_time_t rssi_next_read = 0;
+constexpr int64_t RSSI_REFRESH_INTERVAL_US = 100000;  // 10 Hz
+void bt_rssi_request() {
+    const absolute_time_t now = get_absolute_time();
+    // Self-heal: if an in-flight request never produced its event (link hiccup,
+    // teardown mid-measurement), don't stay blocked forever. 1 s is far longer
+    // than any normal round trip (~10-50 ms).
+    if (rssi_read_pending &&
+        absolute_time_diff_us(rssi_next_read, now) > 1000000) {
+        rssi_read_pending = false;
     }
+    if (acl_handle == HCI_CON_HANDLE_INVALID || rssi_read_pending) return;
+    if (rssi_next_read != 0 &&
+        absolute_time_diff_us(rssi_next_read, now) < RSSI_REFRESH_INTERVAL_US) {
+        return;
+    }
+    rssi_next_read = now;
+    rssi_read_pending = true;
+    gap_read_rssi(acl_handle);
 }
 
 void bt_l2cap_init() {
@@ -150,6 +229,10 @@ void bt_l2cap_init() {
 int bt_init() {
     queue_init(&send_fifo, sizeof(send_element), 10);
 
+    // Load persistent slot table BEFORE HCI comes up so the inquiry filter
+    // and discoverable-gating see the right state on the first event.
+    slots_load();
+
     bt_l2cap_init();
 
     // SSP (Secure Simple Pairing)
@@ -159,7 +242,7 @@ int bt_init() {
     gap_ssp_set_authentication_requirement(SSP_IO_AUTHREQ_MITM_PROTECTION_NOT_REQUIRED_GENERAL_BONDING);
 
     gap_connectable_control(1);
-    gap_discoverable_control(1);
+    slots_update_discoverable();
 
     hci_event_callback_registration.callback = &hci_packet_handler;
     hci_add_event_handler(&hci_event_callback_registration);
@@ -412,6 +495,9 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
             // re-pair them in PS+Share mode (dongle-initiated path). PS-only
             // (controller-initiated) is blocked at CONNECTION_REQUEST.
             if ((cod & 0x000F00) == 0x000500) {
+                // 槽位归属过滤（实现在 slots.cpp）：别的槽的地址跳过；本槽已占用
+                // 时只接受其精确 bd_addr；空槽接受新地址。
+                if (!slots_filter_inquiry(addr)) break;
                 printf("[HCI] Gamepad found: %s (CoD: 0x%06x)\n", bd_addr_to_str(addr), (unsigned int) cod);
                 bd_addr_copy(current_device_addr, addr);
                 device_found = true;
@@ -426,6 +512,7 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
             if (device_found) {
                 printf("[HCI] Connecting to %s...\n", bd_addr_to_str(current_device_addr));
                 new_pair = true;
+                connect_attempt_started = get_absolute_time(); // arm connection watchdog
                 hci_send_cmd(&hci_create_connection, current_device_addr,
                              hci_usable_acl_packet_types(), 0, 0, 0, 1);
                 break;
@@ -433,7 +520,7 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
             if (event_type == HCI_EVENT_INQUIRY_COMPLETE) {
                 // gap_inquiry_start(30);
                 gap_connectable_control(1);
-                gap_discoverable_control(1);
+                slots_update_discoverable();
             }
             break;
         }
@@ -444,6 +531,7 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
             if (opcode == HCI_OPCODE_HCI_CREATE_CONNECTION && status != ERROR_CODE_SUCCESS) {
                 device_found = false;
                 new_pair = false;
+                connect_attempt_started = 0; // disarm; failed before an ACL existed
                 printf("[HCI] Create connection rejected\n");
                 // gap_inquiry_start(30);
             }
@@ -500,6 +588,7 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
             } else {
                 device_found = false;
                 new_pair = false;
+                connect_attempt_started = 0; // disarm; no ACL was established
                 printf("[HCI] ACL connect failed status=0x%02X\n", status);
                 // gap_inquiry_start(30);
             }
@@ -551,7 +640,11 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
             if (status != ERROR_CODE_SUCCESS) {
                 printf("[HCI] Authentication failed, drop stored key for %s\n", bd_addr_to_str(current_device_addr));
                 gap_drop_link_key_for_bd_addr(current_device_addr);
-                // gap_inquiry_start(30);
+                connect_attempt_started = 0; // disarm; teardown below re-inquires
+                // ACL is still up — route through the clean disconnect path
+                // (HCI_EVENT_DISCONNECTION_COMPLETE restarts inquiry) rather
+                // than leaving a half-open ACL.
+                bt_disconnect();
             } else {
                 hci_send_cmd(&hci_set_connection_encryption, handle, 1);
             }
@@ -593,6 +686,7 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
                 // 如果在连接上以后没有停止 inquiry，会导致回报率很低
                 gap_inquiry_stop();
                 hci_send_cmd(&hci_accept_connection_request, addr, 0x01);
+                connect_attempt_started = get_absolute_time(); // arm watchdog (incoming path)
             }
             break;
         }
@@ -608,10 +702,11 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
             }
 #endif
             gap_connectable_control(1);
-            gap_discoverable_control(1);
+            slots_update_discoverable();
             const uint8_t reason = hci_event_disconnection_complete_get_reason(packet);
             device_found = false;
             new_pair = false;
+            connect_attempt_started = 0; // disarm — every teardown clears here
             acl_handle = HCI_CON_HANDLE_INVALID;
             bt_rssi = 0;
             hid_control_cid = 0;
@@ -637,6 +732,7 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
         }
 
         case GAP_EVENT_RSSI_MEASUREMENT: {
+            rssi_read_pending = false;  // request completed — allow the next one
             const hci_con_handle_t handle = gap_event_rssi_measurement_get_con_handle(packet);
             if (handle == acl_handle) {
                 bt_rssi = static_cast<int8_t>(gap_event_rssi_measurement_get_rssi(packet));
@@ -683,26 +779,39 @@ static void __not_in_flash_func(l2cap_packet_handler)(uint8_t packet_type, uint1
                 printf("[L2CAP] HID Control data len=%u\n", size);
                 printf_hexdump(packet, size);
 #endif
+                // 采用上游约定：feature_data 不含报告 ID（上游 2efc855）
+                if (report_id == 0x81) g_report81_seq++; // 0x81 新回执到达（见 get_feature_data）
+#if ENABLE_VERBOSE
+                printf("[L2CAP] Stored Feature Report 0x%02X, len=%u\n", report_id, size - 2);
+#endif
                 if (report_id == 0x20) {
                     if (packet[23] == 0x44) {
                         printf("Connected DSE Controller\n");
                         is_dse = true;
+                        connect_attempt_started = 0; // fully up — disarm watchdog
+                        // 解锁 Edge 档位；USB 先连上，档位读取由 dse_profiles_ready() 门控
                         dse_on_connect();
-
+                        // 上游 ae83907：DSE 在"DS5 模式"下对主机伪装成 DS5 固件信息
                         if (get_config().controller_mode == 0) {
                             feature_data[0x20].assign(report20,report20 + sizeof(report20));
                         }
                     } else {
                         printf("Connected DS5 Controller\n");
                         is_dse = false;
+                        connect_attempt_started = 0; // fully up — disarm watchdog
                     }
 #if !ENABLE_SERIAL
-                    usb_reconnect(false);
+                    // don't re-enumerate while the host is suspended -- it would wake a sleeping host
+                    if (!tud_suspended()) tud_connect();
 #endif
                 }
             }
-
+            // 上游 8a2f576：观察 HID HANDSHAKE（SET 命令是否被手柄接受）
             dse_on_control_packet(packet, size);
+#if ENABLE_VERBOSE
+            printf("[L2CAP] HID Control data len=%u\n", size);
+            printf_hexdump(packet, size);
+#endif
             bt_data_callback(CONTROL, packet, size);
         } else {
             printf("[L2CAP] Data on unknown channel 0x%04X (Interrupt: 0x%04X, Control: 0x%04X)\n",
@@ -721,6 +830,8 @@ static void __not_in_flash_func(l2cap_packet_handler)(uint8_t packet_type, uint1
                 if (psm == PSM_HID_CONTROL) {
                     printf("[L2CAP] HID Control opened cid=0x%04X\n", local_cid);
                     hid_control_cid = local_cid;
+
+                    slots_assign_current(current_device_addr); // 首次配对：记入当前槽
 
                     const auto mtu = l2cap_get_remote_mtu_for_local_cid(hid_control_cid);
                     printf("[L2CAP] Remote Control MTU: %d\n", mtu);
@@ -775,8 +886,12 @@ static void __not_in_flash_func(l2cap_packet_handler)(uint8_t packet_type, uint1
 
                     wake_on_bt_connect();
 
+                    // 上游做法：连接建立后关掉可连接性 = 关掉 page scan。100% 占空
+                    // 扫描只在"等待重连"期间跑；连接期间开着会把射频占满（卡顿根因）。
                     gap_connectable_control(false);
-                    gap_discoverable_control(false);
+                    // OLED Edition: keep discoverable rule centralized — discoverable
+                    // when any slot is empty, dark otherwise.
+                    slots_update_discoverable();
                     // tud_connect();
                 } else {
                     printf("[L2CAP] Unknown Channel psm: 0x%02X", psm);
@@ -869,8 +984,40 @@ void __not_in_flash_func(bt_write)(const uint8_t *data, const uint16_t len) {
 }
 
 vector<uint8_t> get_feature_data(uint8_t reportId, uint16_t len) {
-    // 若为0x81则会请求新内容，其他若有旧数据则不进行请求
     auto ret = vector<uint8_t>{};
+    if (reportId == 0x81) {
+        // 测试命令回执：纯透传——主机每读一次就向手柄发一次查询，当场等回执原样返回，
+        // 不做任何跨请求缓存/队列。多块结果因此天然按"一读一块"对齐（诊断数据错位
+        // 的根因就是读与回执的配对被打散）。上限 ~250ms；"未就绪"（全零）稍等重问；
+        // 等待期间只泵 BT 栈。
+        if (hid_control_cid != 0) {
+            const absolute_time_t total_deadline = make_timeout_time_ms(250);
+            for (int attempt = 0; attempt < 4; ++attempt) {
+                const absolute_time_t pre = make_timeout_time_ms(attempt == 0 ? 10 : 25);
+                while (!time_reached(pre) && !time_reached(total_deadline)) {
+                    cyw43_arch_poll();
+                    sleep_us(200);
+                }
+                const uint32_t seq_before = g_report81_seq;
+                uint8_t get81[] = {0x43, 0x81};
+                l2cap_send(hid_control_cid, get81, sizeof(get81));
+                const absolute_time_t ans_deadline = make_timeout_time_ms(80);
+                while (g_report81_seq == seq_before &&
+                       !time_reached(ans_deadline) && !time_reached(total_deadline)) {
+                    cyw43_arch_poll(); // 泵 BT 栈，让回执能进来
+                    sleep_us(200);
+                }
+                if (g_report81_seq == seq_before) continue; // 没回执 → 再问
+                auto it = feature_data.find(0x81);
+                if (it == feature_data.end() || it->second.size() < 4) break;
+                const uint8_t *p = it->second.data();
+                if (!(p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 0)) break; // 非"未就绪"
+                // 全零 = 手柄还没准备好 → 下一轮重问
+            }
+        }
+        if (feature_data.contains(0x81)) ret = feature_data[0x81];
+        return ret;
+    }
     const bool has_cached_report = feature_data.contains(reportId);
     if (has_cached_report) {
         ret = feature_data[reportId];
@@ -895,6 +1042,11 @@ vector<uint8_t> get_feature_data(uint8_t reportId, uint16_t len) {
         }
     }
     return ret;
+}
+
+std::vector<uint8_t> bt_peek_feature(uint8_t reportId) {
+    auto it = feature_data.find(reportId);
+    return (it != feature_data.end()) ? it->second : std::vector<uint8_t>{};
 }
 
 void set_feature_data(uint8_t reportId, uint8_t *data, uint16_t len) {

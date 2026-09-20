@@ -114,12 +114,15 @@ add_executable(ds5-bridge
         src/main.cpp
         src/usb.cpp
         src/audio.cpp
+        src/auto_haptics.cpp
         src/bt.cpp
         src/button_functions.cpp
         src/dse.cpp
         src/config.cpp
         src/status_gpio.cpp
         src/cmd.cpp
+        src/oled.cpp
+        src/slots.cpp
         src/ram_mem.c
         src/fake_ds5.h
 )
@@ -211,7 +214,7 @@ relocate_to_ram(lib/btstack/src/l2cap.c.o
     ".text.l2cap_acl_handler=.time_critical.l2cap_acl_handler"
     "Phase B.2: l2cap.c l2cap_acl_handler -> RAM")
 relocate_to_ram(lib/tinyusb/src/common/tusb_fifo.c.o
-    ".text.tu_fifo_read=.time_critical.tu_fifo_read|.text.tu_fifo_read_n_access_mode=.time_critical.tu_fifo_read_n_access_mode|.text.tu_fifo_write=.time_critical.tu_fifo_write|.text.tu_fifo_write_n_access_mode=.time_critical.tu_fifo_write_n_access_mode"
+    ".text.tu_fifo_read=.time_critical.tu_fifo_read|.text.tu_fifo_read_n_access_mode=.time_critical.tu_fifo_read_n_access_mode|.text.tu_fifo_write=.time_critical.tu_fifo_write|.text.tu_fifo_write_n_access_mode=.time_critical.tu_fifo_write_n_access_mode|.text.tu_fifo_count=.time_critical.tu_fifo_count"
     "Phase B.2: tusb_fifo.c data path -> RAM")
 relocate_to_ram(src/rp2_common/pico_cyw43_driver/cyw43_bus_pio_spi.c.o
     ".text.cyw43_spi_transfer=.time_critical.cyw43_spi_transfer|.text.cyw43_read_bytes=.time_critical.cyw43_read_bytes|.text.cyw43_write_bytes=.time_critical.cyw43_write_bytes|.text.cyw43_read_reg_u32=.time_critical.cyw43_read_reg_u32|.text.cyw43_read_reg_u16=.time_critical.cyw43_read_reg_u16|.text.cyw43_read_reg_u8=.time_critical.cyw43_read_reg_u8|.text.cyw43_write_reg_u32=.time_critical.cyw43_write_reg_u32|.text.cyw43_write_reg_u16=.time_critical.cyw43_write_reg_u16|.text.cyw43_write_reg_u8=.time_critical.cyw43_write_reg_u8|.text.read_reg_u32_swap=.time_critical.read_reg_u32_swap|.text.write_reg_u32_swap=.time_critical.write_reg_u32_swap|.text.ns_delay.constprop.0=.time_critical.cyw43_ns_delay"
@@ -254,8 +257,8 @@ relocate_to_ram(lib/tinyusb/src/class/hid/hid_device.c.o
     ".text.tud_hid_n_report=.time_critical.tud_hid_n_report|.text.tud_hid_n_ready=.time_critical.tud_hid_n_ready|.text.hidd_xfer_cb=.time_critical.hidd_xfer_cb"
     "Phase B.4: hid_device.c report path -> RAM")
 relocate_to_ram(src/common/pico_util/queue.c.o
-    ".text.queue_try_add=.time_critical.queue_try_add|.text.queue_try_remove=.time_critical.queue_try_remove"
-    "Phase B.4: pico_util queue add/remove -> RAM")
+    ".text.queue_try_add=.time_critical.queue_try_add|.text.queue_try_remove=.time_critical.queue_try_remove|.text.queue_get_level=.time_critical.queue_get_level|.text.queue_is_full=.time_critical.queue_is_full"
+    "Phase B.4: pico_util queue ops -> RAM (OLED: +get_level/is_full)")
 relocate_to_ram(src/rp2_common/pico_cyw43_arch/cyw43_arch.c.o
     ".text.cyw43_arch_poll=.time_critical.cyw43_arch_poll"
     "Phase B.4: cyw43_arch_poll -> RAM")
@@ -306,12 +309,28 @@ target_compile_definitions(ds5-bridge PRIVATE
         DISABLE_SPEAKER_PROC=${DISABLE_SPEAKER_PROC_VALUE}
 )
 
-# Wake-on-PS + Xbox Game Bar are now in the base firmware, gated at runtime by the
-# enable_wake / ps_shortcut_enabled config fields. ENABLE_WAKE_HID stays defined so
-# the wake/keyboard descriptors and TinyUSB capacity compile in; the interface and
-# behavior are only presented/run when enabled at runtime (see usb_descriptors.cpp,
-# wake.cpp).
-target_compile_definitions(ds5-bridge PRIVATE ENABLE_WAKE_HID)
+# DS5_UPSTREAM_HID_DESC：HID 报告描述符可选切到上游原版（321 字节、声明 F6-F9）。
+# 默认 OFF = 289 字节与真 DS5 逐字节一致（游戏内原生自适应扳机依赖这个）；
+# ON = 上游形态，浏览器 WebHID 配置工具才能访问 F6-F9（游戏内扳机会失效）。
+option(DS5_UPSTREAM_HID_DESC "Use upstream's 321-byte HID report descriptor (declares F6-F9; breaks in-game native triggers)" OFF)
+if(DS5_UPSTREAM_HID_DESC)
+    target_compile_definitions(ds5-bridge PRIVATE DS5_UPSTREAM_HID_DESC)
+endif()
+
+# OLED Edition: 上游的 wake-on-PS / Xbox Game Bar 需要第二个 HID 接口（键盘），
+# 会破坏“与真 DS5 完全一致的单一 HID 描述符”（HID 数量 = 1，见 tusb_config.h）。
+# 因此这里不定义 ENABLE_WAKE_HID、不编译 wake.cpp / ps_shortcut.cpp——上游代码里
+# 所有相关路径都由 #ifdef ENABLE_WAKE_HID 保护，宏未定义时自动编译掉。
+# wake.h 在宏未定义时提供空操作 stub（usb.cpp/main.cpp 的调用点无需改动）；
+# wake.cpp 整段被 #ifdef ENABLE_WAKE_HID 包住（无宏时编译为空 TU），
+# ps_shortcut.cpp 由 ps_shortcut_enabled 运行时门控（默认 0，不会触发）。
+# 需要完整上游功能时显式打开：-DENABLE_WAKE_HID=ON —— 此时 HID 数量 = 2、DS5
+# 描述符不再逐字节一致；OLED 设置页的 Wake / PS Short 两项随该宏显示（保存后
+# 自动重新枚举）。上游此处是无条件 define，rebase 时留意这处刻意偏离。
+option(ENABLE_WAKE_HID "Enable wake-on-PS + Xbox Game Bar (adds a 2nd HID keyboard interface)" OFF)
+if(ENABLE_WAKE_HID)
+    target_compile_definitions(ds5-bridge PRIVATE ENABLE_WAKE_HID)
+endif()
 target_sources(ds5-bridge PRIVATE
         src/wake.cpp
         src/ps_shortcut.cpp
@@ -325,6 +344,14 @@ if(WAKE_DEBUG)
 endif()
 
 set(VERSION "dev" CACHE STRING "Program version string")
+
+# Expose VERSION to firmware C++ as FIRMWARE_VERSION so src/oled.cpp's
+# Status header always reflects the release tag (set by release.yml via
+# -DVERSION="$FIRMWARE_VERSION"). Local builds without -DVERSION show
+# "dev" — visible signal that you're not on a tagged release.
+target_compile_definitions(ds5-bridge PRIVATE
+        FIRMWARE_VERSION="${VERSION}"
+)
 
 pico_set_program_name(ds5-bridge "ds5-bridge")
 pico_set_program_version(ds5-bridge "${VERSION}")
@@ -349,6 +376,8 @@ target_link_libraries(ds5-bridge
         hardware_watchdog
         hardware_timer
         hardware_flash
+        hardware_spi
+        hardware_adc
         pico_btstack_classic
 #        pico_cyw43_arch_threadsafe_background
         pico_cyw43_arch_poll

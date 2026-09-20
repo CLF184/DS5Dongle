@@ -27,6 +27,8 @@
 #include "tusb.h"
 #include "config.h"
 #include "usb.h"
+#include "bt.h"
+#include "slots.h"
 
 #ifndef ENABLE_SERIAL
 #define ENABLE_SERIAL 0
@@ -118,7 +120,15 @@ tusb_desc_device_t desc_device =
 
     .iManufacturer = 0x01,
     .iProduct = 0x02,
-    // .iSerialNumber = 0x00,
+    // OLED Edition restores the per-board serial number that upstream stripped
+    // in commit e79c762 ("remove usb serialnumber #32"). Without it, Windows
+    // treats the dongle as a NEW device for each USB port (issue awalol#100):
+    // users lose their per-device volume / app preferences when they move
+    // ports. The trade-off (re-introducing SpecialK incompatibility from #32)
+    // affects only Windows users with that specific tool; the broader Windows
+    // population gets stable device identity back. The serial string itself
+    // is produced by board_usb_get_serial() from the flash chip's unique ID.
+    .iSerialNumber = STRID_SERIAL,
 
     .bNumConfigurations = 0x01
 };
@@ -392,7 +402,11 @@ uint8_t descriptor_configuration[] = {
     0x00, // bCountryCode: Not localized
     0x01, // bNumDescriptors: 1 report descriptor
     0x22, // bDescriptorType: Report
-    0x41, 0x01, // wDescriptorLength: 321 (0x0141) DS
+#ifdef DS5_UPSTREAM_HID_DESC
+    0x41, 0x01, // wDescriptorLength: 321 (0x0141) DS（上游原版）
+#else
+    0x21, 0x01, // wDescriptorLength: 289 (0x0121) DS  (F6-F9 removed to byte-match a real DS5)
+#endif
     // 0xB5, 0x01, // wDescriptorLength: 437 (0x01B5) DSE
 
     // Endpoint Descriptor (HID IN: EP4)
@@ -452,14 +466,24 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
     descriptor_configuration[offset - 1] = bInterval;
     descriptor_configuration[offset - 8] = bInterval;
     if (ds_mode()) {
-        descriptor_configuration[offset - 16] = 0x41;
+#ifdef DS5_UPSTREAM_HID_DESC
+        descriptor_configuration[offset - 16] = 0x41; // wDescriptorLength lo = 321（上游原版）
+#else
+        descriptor_configuration[offset - 16] = 0x21; // wDescriptorLength lo = 289 (0x0121); F6-F9 removed to byte-match a real DS5
+#endif
     }else {
         descriptor_configuration[offset - 16] = 0xB5;
     }
 
-    // Wake / Game Bar are runtime features. Advertise REMOTE_WAKEUP only when wake is
-    // on, and include the keyboard interface (the LAST descriptor block) only when wake
-    // OR the Game Bar shortcut is on. With both off this is byte-identical to the base.
+    // Wake / Game Bar are runtime features (upstream): advertise REMOTE_WAKEUP and
+    // include the keyboard interface only when they're on.
+    //
+    // OLED Edition 注意：这段补丁假设 ITF_NUM_TOTAL 里含键盘接口（上游永远定义
+    // ENABLE_WAKE_HID）。本固件不定义该宏、没有键盘接口，ITF_NUM_TOTAL 就是 4
+    // (3 audio + 1 HID) —— 若照跑，"kbd 关"分支会把 bNumInterfaces 打成 3，
+    // 与实际接口数不符 → Windows 判"错误的设备"、HID（手柄本体）直接消失。
+    // 因此整体编译掉：不编译时描述符 = 静态数组 = 与真 DS5 逐字节一致（fork 已知可用形态）。
+#ifdef ENABLE_WAKE_HID
     const bool wake = get_config().enable_wake;
     const bool kbd = wake || get_config().ps_shortcut_enabled;
     descriptor_configuration[7] = wake ? 0xE0 : 0xC0; // bmAttributes (REMOTE_WAKEUP bit)
@@ -468,6 +492,7 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
     descriptor_configuration[2] = (uint8_t) (total & 0xFF);                  // wTotalLength lo
     descriptor_configuration[3] = (uint8_t) (total >> 8);                    // wTotalLength hi
     descriptor_configuration[4] = kbd ? ITF_NUM_TOTAL : (ITF_NUM_TOTAL - 1); // bNumInterfaces
+#endif
     return descriptor_configuration;
 }
 
@@ -617,6 +642,7 @@ uint8_t const desc_hid_report_ds[] = {
     0x09, 0x36, //   Usage (0x36)
     0x95, 0x03, //   Report Count (3)
     0xB1, 0x02, //   Feature (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position,Non-volatile)
+#ifdef DS5_UPSTREAM_HID_DESC
     0x85, 0xF6, //   Report ID (-10)
     0x09, 0x37, //   Usage (Vendor 0x37)
     0x95, 0x3F, //   Report Count (63)
@@ -633,10 +659,19 @@ uint8_t const desc_hid_report_ds[] = {
     0x09, 0x3A, //   Usage (Vendor 0x3A)
     0x95, 0x3F, //   Report Count (63)
     0xB1, 0x02, //   Feature (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position,Non-volatile)
+#endif
     0xC0, // End Collection
-    // 321 bytes
+#ifdef DS5_UPSTREAM_HID_DESC
+    // 321 bytes（上游原版）
+#else
+    // 289 bytes — byte-identical to a real DualSense
+#endif
 };
+#ifdef DS5_UPSTREAM_HID_DESC
 static_assert(sizeof(desc_hid_report_ds) == 321);
+#else
+static_assert(sizeof(desc_hid_report_ds) == 0x0121);
+#endif
 
 uint8_t const desc_hid_report_dse[] = {
     0x05, 0x01, // Usage Page (Generic Desktop Ctrls)
@@ -945,10 +980,35 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
             chr_count = 1;
             break;
 
-        case STRID_SERIAL:
-            chr_count = board_usb_get_serial(_desc_str + 1, 32) + 1;
-            _desc_str[chr_count] = '2'; // refresh windows cache (bumped for 2-ch mic)
+        case STRID_SERIAL: {
+            // Present like a REAL DualSense: USB serial == controller MAC, the
+            // same value the 0x09 pairing-info feature report returns. Before
+            // this the serial was the Pico flash unique id, so the host saw two
+            // identities for one controller (flash-id over USB, MAC over 0x09)
+            // and Wine/Steam device-matching choked. Prefer the live connected
+            // MAC; fall back to the current slot's stored MAC (known at boot,
+            // before BT connects); finally fall back to the flash id if never
+            // paired so the descriptor is always valid.
+            uint8_t mac[6] = {0};
+            bool have = false;
+            bt_get_addr(mac);
+            for (int i = 0; i < 6; ++i) if (mac[i]) { have = true; break; }
+            if (!have) {
+                slot_get_addr(get_config().current_slot, mac);
+                for (int i = 0; i < 6; ++i) if (mac[i]) { have = true; break; }
+            }
+            if (have) {
+                static const char hexd[] = "0123456789ABCDEF";
+                for (int i = 0; i < 6; ++i) {
+                    _desc_str[1 + i * 2]     = hexd[(mac[i] >> 4) & 0x0F];
+                    _desc_str[1 + i * 2 + 1] = hexd[mac[i] & 0x0F];
+                }
+                chr_count = 12;
+            } else {
+                chr_count = board_usb_get_serial(_desc_str + 1, 32);
+            }
             break;
+        }
 
         default:
             // Note: the 0xEE index string is a Microsoft OS 1.0 Descriptors.
