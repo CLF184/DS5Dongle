@@ -8,6 +8,8 @@
 #include <cstddef>  // offsetof
 #include "status_gpio.h" // 上游"状态 GPIO"特性（合法引脚判定 + STATUS_GPIO_DISABLED）
 #include "usb.h"         // usb_reconnect（USB 序列号开关保存后重新枚举）
+#include "loop_probe.h"  // Diag 屏的 Loop0/Loop1 抖动行
+#include "fast_time.h"   // 每轮的门控判断用内联 µs 读数（见该文件注释）
 
 #include <cstdio>
 #include <cstring>
@@ -66,6 +68,11 @@ uint8_t fb[kFbBytes];
 
 uint32_t last_render_us = 0;
 constexpr uint32_t kFrameUs = 100000;
+// 开机 splash 的保持窗口（boot_splash() 设置）。splash 只画一次、到点前不重绘，
+// 所以主循环（tud_task/BT）立刻就能跑起来，而不是睡 1.5 秒。
+// splash_done 让每轮只剩一次 bool 判断 —— 只有开机那 1.5 秒才需要看时间。
+uint32_t splash_deadline_us = 0;
+bool     splash_done = true;
 bool key0_prev = true;
 bool key1_prev = true;
 uint32_t key0_t_us = 0;
@@ -215,13 +222,24 @@ bool settings_dirty = false;
 bool settings_init_done = false;
 uint8_t settings_last_dpad = 8;  // 8 = released
 uint8_t settings_last_face = 0;
-const char* settings_save_status = "";  // shown briefly after Triangle press
+const char* settings_save_status = "";     // shown on the footer after an action
+uint32_t settings_status_until_us = 0;     // deadline for that message
 
 // Factory-reset hold-Triangle-2s state. Borrowed from zurce/DS5Dongle-OLED's
 // "hold to wipe" UX pattern (https://github.com/zurce/DS5Dongle-OLED).
 uint32_t settings_tri_press_us = 0;
 bool settings_reset_triggered = false;
 constexpr uint32_t kResetHoldUs = 2000000;
+constexpr uint32_t kSettingsStatusUs = 2000000; // save/reset feedback hold time
+
+// Show a save/reset result for a couple of seconds. It renders on the footer
+// row, which is the only place the long messages ("Slots wiped!", "Reset FAIL")
+// fit — next to the "Settings (*)" header the old x=86 draw ran off the panel
+// past ~6 characters.
+void settings_set_status(const char* s) {
+    settings_save_status = s;
+    settings_status_until_us = (uint32_t)time_us_32() + kSettingsStatusUs;
+}
 
 uint8_t lb_r = 0, lb_g = 0, lb_b = 0;
 
@@ -251,17 +269,12 @@ uint8_t triggers_last_face = 0;
 uint8_t lb_last_buttons = 0;
 constexpr int kNumTrigPresets = 7;
 
+// 一次 SPI 事务写一个字节。注释见 flush_fb_raw()：整帧刷屏不再走这里（改批量），
+// 只有 init / 对比度 / 开关屏这些零散命令用。
 void cmd(uint8_t c) {
     gpio_put(kPinDC, 0);
     gpio_put(kPinCS, 0);
     spi_write_blocking(spi1, &c, 1);
-    gpio_put(kPinCS, 1);
-}
-
-void data_byte(uint8_t d) {
-    gpio_put(kPinDC, 1);
-    gpio_put(kPinCS, 0);
-    spi_write_blocking(spi1, &d, 1);
     gpio_put(kPinCS, 1);
 }
 
@@ -271,6 +284,30 @@ uint8_t reverse_byte(uint8_t b) {
     b = ((b & 0x0F) << 4) | ((b & 0xF0) >> 4);
     return b;
 }
+
+// 位反转查表（面板是 LSB-first），oled_init() 里用 reverse_byte() 填一次 ——
+// 每帧 1024 次位运算换成查表。256 B RAM / 520 KB，不心疼。
+uint8_t rev_lut[256];
+
+// 面板 GDDRAM 当前内容的镜像。SH1107 自带显存，所以"和上一帧完全一样"的扫描线
+// 根本不用发 —— 静态屏（Settings/Slots/CPU/Diag…）的 SPI 开销直接归零，dim
+// 呼吸点"灭"的那一秒同样是零。
+//
+// 不变量：往面板显存里写数据的**唯一**出口是 flush_fb_raw()（cmd() 只发命令）。
+// 以后若新增直接写 pattern/显存的功能，必须同步 fb_shadow，否则那一块会永久停在
+// 旧画面上 —— 或者干脆在开头把 fb_shadow_valid 置 false 强制整屏重发一次。
+uint8_t fb_shadow[kFbBytes];
+bool fb_shadow_valid = false;   // false = 还没发过（上电后必须整屏发一次）
+
+// fb 的"内容代次"：任何会把 fb 内容搞失效的事件都 +1 —— 切屏（别的屏画满了 fb）、
+// 进入 dim/off 档（呼吸点把 fb 清了）、上电。做局部刷新的渲染器缓存自己上次画完时
+// 的代次，发现变了就整屏重画。少了这道保险，切走再切回来时它会以为"这块还是我画的
+// 那副样子"而跳过绘制，屏幕上留着上一屏的内容。
+uint32_t g_fb_generation = 1;
+
+// 输入签名（FNV-1a）：给"某个区域依赖的输入"算个 32 位指纹，变了才重画那块。
+// 各处依赖的输入个数不同，混进来的值也大小不一（电量字节、ETA 分钟数…）。
+inline uint32_t sig_mix(uint32_t h, uint32_t v) { return (h ^ v) * 16777619u; }
 
 void hw_reset() {
     gpio_put(kPinRST, 1); sleep_ms(100);
@@ -310,16 +347,50 @@ void sh1107_init() {
 // lives near the other text-drawing helpers below.
 void draw_button_chrome();
 
+// 把 fb 推给面板。
+//
+// 布局：玻璃是 64 列 × 128 行、跑在纵向寻址模式（sh1107_init 里的 0x21），
+// 所以「一行 fb」（16 字节 = 128 px）就是「一列玻璃」——16 个数据字节依次落在
+// 该列的 page 0..15。每写一列都重发一次 0xB0，把起始 page 显式钉死，这样跳过
+// 中间某几列也不会让 page 指针错位。
+//
+// 开销：老写法每个字节一次 CS 包裹的 SPI 事务（约 1200 次调用、~2 ms 主循环
+// 停顿 —— 和喂 USB/BT 的是同一个循环）。现在每列 2 次事务（命令段 + 数据段），
+// 且 CS 整帧保持拉低、只切 DC，线上字节流与老写法完全一致。再叠加"没变的列不
+// 发"，静态屏每帧开销为 0，动得最凶的屏也在 1 ms 以内。
 void flush_fb_raw() {
-    cmd(0xB0);
+    bool any_sent = false;
+    uint8_t line[kRowBytes];
+
     for (int j = 0; j < kH; j++) {
-        const uint8_t col = kH - 1 - j;
-        cmd(0x00 + (col & 0x0F));
-        cmd(0x10 + (col >> 4));
-        for (int i = 0; i < kRowBytes; i++) {
-            data_byte(reverse_byte(fb[j * kRowBytes + i]));
+        const uint8_t *src = &fb[j * kRowBytes];
+        uint8_t *shadow = &fb_shadow[j * kRowBytes];
+        if (fb_shadow_valid && memcmp(src, shadow, kRowBytes) == 0) continue;
+
+        if (!any_sent) {
+            // 本帧第一个要发的列 —— 这时才占总线
+            gpio_put(kPinCS, 0);
+            const uint8_t page0 = 0xB0;
+            gpio_put(kPinDC, 0);
+            spi_write_blocking(spi1, &page0, 1);
+            any_sent = true;
         }
+
+        const uint8_t col = kH - 1 - j;
+        const uint8_t col_cmd[2] = {(uint8_t)(0x00 + (col & 0x0F)),
+                                    (uint8_t)(0x10 + (col >> 4))};
+        gpio_put(kPinDC, 0);
+        spi_write_blocking(spi1, col_cmd, 2);
+
+        for (int i = 0; i < kRowBytes; i++) line[i] = rev_lut[src[i]];
+        gpio_put(kPinDC, 1);
+        spi_write_blocking(spi1, line, kRowBytes);
+
+        memcpy(shadow, src, kRowBytes);
     }
+
+    if (any_sent) gpio_put(kPinCS, 1);
+    fb_shadow_valid = true;
 }
 
 void flush_fb() {
@@ -329,39 +400,114 @@ void flush_fb() {
 
 void fb_clear() { memset(fb, 0, sizeof(fb)); }
 
+// 单像素（摇杆点、竖直细线、图标用）。保留独立的窄路径：单点走 span 反而更慢。
 void px(int x, int y, bool on) {
     if (x < 0 || x >= kW || y < 0 || y >= kH) return;
-    uint8_t *p = &fb[y * kRowBytes + (x / 8)];
-    uint8_t m = 1 << (7 - (x % 8));
+    uint8_t *p = &fb[y * kRowBytes + (x >> 3)];
+    const uint8_t m = (uint8_t)(1u << (7 - (x & 7)));
     if (on) *p |= m; else *p &= ~m;
 }
 
+// ---- 水平段操作 -------------------------------------------------------------
+// 屏上一行 16 字节、MSB 在左（x=0 → bit7）。矩形填充/清空/反色、文字行的每一行
+// 最终都落到"某一行的连续一段像素"上，这里按整字节写：中间整字节一次 memset，
+// 只有首尾两个字节需要按位掩码。老实现逐像素 px()（每像素 4 次边界比较 + 移位），
+// 一个 32×32 的框要 1024 次；现在上下两条边各 1 次 span。
+enum SpanOp : uint8_t { SPAN_SET, SPAN_CLEAR, SPAN_XOR };
+
+inline void span_apply(SpanOp op, uint8_t *p, uint8_t m) {
+    switch (op) {
+        case SPAN_SET:   *p |=  m;  break;
+        case SPAN_CLEAR: *p &= ~m;  break;
+        case SPAN_XOR:   *p ^=  m;  break;
+    }
+}
+
+inline void span(int x, int y, int w, SpanOp op) {
+    if (w <= 0 || y < 0 || y >= kH) return;
+    if (x < 0) { w += x; x = 0; }
+    if (x + w > kW) w = kW - x;
+    if (w <= 0) return;
+
+    uint8_t *p = &fb[y * kRowBytes + (x >> 3)];
+    const int b1 = (x + w - 1) >> 3;                        // 最后一个涉及的字节
+    const int full = b1 - (x >> 3);                         // 0 = 首末落在同一字节
+    const uint8_t m_head = (uint8_t)(0xFF >> (x & 7));
+    const uint8_t m_tail = (uint8_t)(0xFF << (7 - ((x + w - 1) & 7)));
+
+    if (full == 0) { span_apply(op, p, (uint8_t)(m_head & m_tail)); return; }
+    span_apply(op, p, m_head);
+    if (full > 1) {
+        uint8_t *mid = p + 1;
+        const int n = full - 1;
+        switch (op) {
+            case SPAN_SET:   memset(mid, 0xFF, (size_t)n); break;
+            case SPAN_CLEAR: memset(mid, 0x00, (size_t)n); break;
+            case SPAN_XOR:   for (int i = 0; i < n; i++) mid[i] = (uint8_t)~mid[i]; break;
+        }
+    }
+    span_apply(op, p + full, m_tail);
+}
+
 void rect_outline(int x, int y, int w, int h) {
-    for (int i = 0; i < w; i++) { px(x + i, y, true); px(x + i, y + h - 1, true); }
-    for (int i = 0; i < h; i++) { px(x, y + i, true); px(x + w - 1, y + i, true); }
+    if (w <= 0 || h <= 0) return;
+    span(x, y, w, SPAN_SET);                        // 上边
+    if (h > 1) span(x, y + h - 1, w, SPAN_SET);     // 下边
+    for (int j = 1; j < h - 1; j++) {               // 左右两条竖边：单像素，走 px
+        px(x, y + j, true);
+        px(x + w - 1, y + j, true);
+    }
 }
 
 void rect_filled(int x, int y, int w, int h) {
-    for (int j = 0; j < h; j++)
-        for (int i = 0; i < w; i++)
-            px(x + i, y + j, true);
+    for (int j = 0; j < h; j++) span(x, y + j, w, SPAN_SET);
+}
+
+// 清一块矩形 —— 局部刷新重画某区域前，先把它自己的地盘擦干净。
+void rect_clear(int x, int y, int w, int h) {
+    for (int j = 0; j < h; j++) span(x, y + j, w, SPAN_CLEAR);
 }
 
 // XOR-invert every pixel in a region (used to flash a control "pressed").
 void rect_invert(int x, int y, int w, int h) {
-    for (int j = 0; j < h; j++)
-        for (int i = 0; i < w; i++) {
-            const int xx = x + i, yy = y + j;
-            if (xx < 0 || xx >= kW || yy < 0 || yy >= kH) continue;
-            fb[yy * kRowBytes + (xx / 8)] ^= 1 << (7 - (xx % 8));
-        }
+    for (int j = 0; j < h; j++) span(x, y + j, w, SPAN_XOR);
 }
+
+// 字形转置表：kFont5x7 是列存（一字节 = 一列的 7 个像素），逐像素画很浪费；
+// 转置成"每行 5 bit"后，一个字形 = 7 次查表 + 每行 1~2 次字节 OR。
+// bit4 = 最左像素。开机在 oled_init() 建一次（95×7 = 665 B RAM）。
+uint8_t font_rows[95][kFontH];
 
 void draw_char(int x, int y, char c) {
     if (c < 0x20 || c > 0x7E) return;
+
+    // 快路径：整个字形都在屏内（本文件所有 draw_text 都满足），不用逐像素裁剪
+    if (x >= 0 && y >= 0 && x + kFontW <= kW && y + kFontH <= kH) {
+        const uint8_t *rows = font_rows[c - 0x20];
+        uint8_t *p = &fb[y * kRowBytes + (x >> 3)];
+        const int sh = x & 7;
+        for (int row = 0; row < kFontH; row++) {
+            const uint8_t bits = rows[row];
+            if (!bits) continue;
+            // 5 个像素最多跨 2 个字节：分别攒出两边的掩码，一次 OR 进去
+            uint8_t m0 = 0, m1 = 0;
+            for (int i = 0; i < kFontW; i++) {
+                if (!(bits & (1u << (kFontW - 1 - i)))) continue;
+                const int b = sh + i;
+                if (b < 8) m0 |= (uint8_t)(1u << (7 - b));
+                else       m1 |= (uint8_t)(1u << (7 - (b - 8)));
+            }
+            uint8_t *r = p + row * kRowBytes;
+            r[0] |= m0;
+            if (m1) r[1] |= m1;      // x+5 ≤ kW 保证 b0+1 ≤ 15，不会越出本行
+        }
+        return;
+    }
+
+    // 慢路径（理论上到不了）：列存字库 + 逐像素裁剪
     const uint8_t *g = kFont5x7[c - 0x20];
     for (int col = 0; col < kFontW; col++) {
-        uint8_t bits = g[col];
+        const uint8_t bits = g[col];
         for (int row = 0; row < kFontH; row++) {
             if (bits & (1 << row)) px(x + col, y + row, true);
         }
@@ -545,7 +691,7 @@ void send_trigger_effect(int preset) {
 void send_lightbar_color(uint8_t r, uint8_t g, uint8_t b);
 
 void handle_buttons() {
-    const uint32_t now = time_us_32();
+    const uint32_t now = fast_now_us();   // 每轮调用：省掉 time_us_32 的函数调用（见 fast_time.h）
     const bool k0 = gpio_get(kPinKey0);
     const bool k1 = gpio_get(kPinKey1);
 
@@ -754,26 +900,87 @@ void sample_charge_eta() {
     }
 }
 
+// ---- 状态屏的局部刷新 -------------------------------------------------------
+// 这块屏是唯一"一直在动"的屏（摇杆点、扳机条、按键方块在做游戏时一直在变），
+// 所以切成 5 块，各自只在自己依赖的输入变化时才"清 + 画"：
+//   0 顶栏    y=0..7                    标题 + 链接图标
+//   1 信息行  x≥6, y=9..25              MAC / 电量 / ETA（含 snprintf，最贵的一块）
+//   2 摇杆    两个 32×32 框             最细粒度：点没动就一个像素都不碰
+//   3 扳机条  x=38..41 / 92..95, y≥33
+//   4 按键    x=42..91, y=30..56        十字键 + 面键 + L1/R1
+// 签名没变 → 整块跳过，面板继续显示上一帧（SH1107 自带显存）。
+// fb 代次变了（切屏 / 从 dim 回来 / 上电）→ fb_clear() + 全部重画。
 __attribute__((noinline)) void render_screen() {
-    fb_clear();
-
     const bool connected = bt_is_connected();
 
-    // FIRMWARE_VERSION is set via CMake from -DVERSION=... on the build
-    // command line (release.yml passes the tag name). Local builds get
-    // "dev" so a non-tagged build is visible at a glance.
-    draw_text(kContentX, 0, "DS5 Bridge " FIRMWARE_VERSION);
-    draw_icon(120, 0, connected ? kIconLinkOn : kIconLinkOff, 8, 8);
+    static uint32_t seen_gen = 0;
+    static uint32_t sig_last[4] = {0, 0, 0, 0};   // 顶栏 / 信息行 / 扳机条 / 按键
+    static bool     prev_connected = false;
+    struct Stick { int8_t x, y; bool inv, valid; };
+    static Stick stick[2] = {{-1, -1, false, false}, {-1, -1, false, false}};
 
-    if (connected) {
-        uint8_t a[6];
-        bt_get_addr(a);
+    // 连接/断连是两套完全不同的布局 → 也算整屏重画
+    const bool layout_changed = (connected != prev_connected);
+    prev_connected = connected;
+    const bool force = layout_changed || (seen_gen != g_fb_generation);
+    seen_gen = g_fb_generation;
+    if (force) {
+        fb_clear();
+        stick[0].valid = stick[1].valid = false;
+    }
+
+    // 各块依赖的输入签名
+    uint8_t addr[6] = {0};
+    if (connected) bt_get_addr(addr);
+    const uint8_t pwr = interrupt_in_data[52];
+    const ChargeEta ce = g_charge_eta;
+
+    const uint32_t h_top = sig_mix(2166136261u, connected);  // 标题是编译期常量，只有链接图标跟连接状态走
+    uint32_t h_info = 2166136261u;
+    for (int i = 0; i < 6; i++) h_info = sig_mix(h_info, addr[i]);
+    h_info = sig_mix(h_info, pwr);
+    h_info = sig_mix(h_info, (uint32_t)(ce.charging | (ce.valid << 1) | (ce.provisional << 2)));
+    h_info = sig_mix(h_info, (uint32_t)ce.minutes);
+    const uint32_t h_bar = sig_mix(sig_mix(2166136261u, interrupt_in_data[4]), interrupt_in_data[5]);
+    const uint32_t h_btn = sig_mix(sig_mix(2166136261u, interrupt_in_data[7]),
+                                   interrupt_in_data[8] & 0x03);
+
+    // ---- 区域 0：顶栏 ----
+    if (force || h_top != sig_last[0]) {
+        sig_last[0] = h_top;
+        rect_clear(0, 0, kW, 8);
+        // FIRMWARE_VERSION is set via CMake from -DVERSION=... on the build
+        // command line (release.yml passes the tag name). Local builds get
+        // "dev" so a non-tagged build is visible at a glance.
+        // 19-char cap keeps the title clear of the 8x8 link icon at x=120 even if a
+        // future tag (FIRMWARE_VERSION) is long.
+        char title[20];
+        snprintf(title, sizeof(title), "DS5 Bridge %s", FIRMWARE_VERSION);
+        draw_text(kContentX, 0, title);
+        draw_icon(120, 0, connected ? kIconLinkOn : kIconLinkOff, 8, 8);
+    }
+
+    if (!connected) {
+        // 未连接的配对提示是纯静态的：整屏重画时画一次就够
+        if (force) {
+            draw_text(kContentX, 14, "Pair your DualSense:");
+            draw_text(kContentX, 26, "1. Hold Create + PS");
+            draw_text(kContentX, 36, "2. Wait for light bar");
+            draw_text(kContentX, 46, "   to flash blue");
+        }
+        flush_fb();
+        return;
+    }
+
+    // ---- 区域 1：信息行（MAC + 电量 + ETA）----
+    if (force || h_info != sig_last[1]) {
+        sig_last[1] = h_info;
+        rect_clear(kContentX, 9, kW - kContentX, 17);   // y=9..25 整条
         char buf[24];
         snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 a[0], a[1], a[2], a[3], a[4], a[5]);
+                 addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
         draw_text(kContentX, 9, buf);
 
-        const uint8_t pwr = interrupt_in_data[52];
         int pct = (pwr & 0x0F) * 10;
         if (pct > 100) pct = 100;
         const uint8_t pstate = pwr >> 4;
@@ -786,45 +993,74 @@ __attribute__((noinline)) void render_screen() {
         draw_text(kContentX, 18, bbuf);
         draw_battery_icon(36, 18, pct);
 
-        // Charge ETA, right of the battery icon (icon ends at x≈90). Shown only
-        // while charging: "~43m?" is the provisional default-rate estimate shown
-        // immediately on plug-in; the "?" drops to "~43m" once a real 10% step
-        // has been timed and the measured rate takes over. See sample_charge_eta().
-        if (g_charge_eta.charging) {
+        // Charge ETA, right of the battery icon (icon + nub end at x=90). Shown
+        // only while charging: "~43m?" is the provisional default-rate estimate
+        // shown immediately on plug-in; the "?" drops to "~43m" once a real 10%
+        // step has been timed and the measured rate takes over. See
+        // sample_charge_eta(). x=92 (not 94) so a 3-digit "~145m?" stays on panel.
+        if (ce.charging) {
             char ebuf[8];
-            if (g_charge_eta.valid)
-                snprintf(ebuf, sizeof(ebuf), "~%dm%s", g_charge_eta.minutes,
-                         g_charge_eta.provisional ? "?" : "");
+            if (ce.valid)
+                snprintf(ebuf, sizeof(ebuf), "~%dm%s", ce.minutes,
+                         ce.provisional ? "?" : "");
             else
                 snprintf(ebuf, sizeof(ebuf), "~--m");
-            draw_text(94, 18, ebuf);
+            draw_text(92, 18, ebuf);
         }
+    }
 
-        // Left-half visuals are shifted right by kContentX so the < button
-        // chrome at (x=0, y=49) doesn't paint over the live stick dot.
-        rect_outline(kContentX, 30, 32, 32);
-        int lx = (kContentX + 2) + (interrupt_in_data[0] * 27) / 255;
-        int ly = 32 + (interrupt_in_data[1] * 27) / 255;
-        rect_filled(lx - 1, ly - 1, 3, 3);
-        // L3 (left stick click) — invert the whole box as a pressed indicator.
-        if (interrupt_in_data[8] & 0x40) rect_invert(kContentX, 30, 32, 32);
+    // ---- 区域 2：两个摇杆（最细粒度 —— 只动点）----
+    {
+        const uint8_t b8 = interrupt_in_data[8];
+        for (int i = 0; i < 2; i++) {
+            // Left-half visuals are shifted right by kContentX so the < button
+            // chrome at (x=0, y=49) doesn't paint over the live stick dot.
+            const int  bx  = i ? 96 : kContentX;
+            const int  lx  = (bx + 2) + (interrupt_in_data[i * 2] * 27) / 255;
+            const int  ly  = 32 + (interrupt_in_data[i * 2 + 1] * 27) / 255;
+            // L3 / R3 (stick click) — invert the whole box as a pressed indicator.
+            const bool inv = i ? (b8 & 0x80) : (b8 & 0x40);
+            Stick &st = stick[i];
 
-        rect_outline(96, 30, 32, 32);
-        int rx = 98 + (interrupt_in_data[2] * 27) / 255;
-        int ry = 32 + (interrupt_in_data[3] * 27) / 255;
-        rect_filled(rx - 1, ry - 1, 3, 3);
-        // R3 (right stick click) — invert the whole box.
-        if (interrupt_in_data[8] & 0x80) rect_invert(96, 30, 32, 32);
+            // 反色（L3/R3 按住）时背景不是纯黑，"擦旧点画新点"的捷径会留错像素
+            // —— 整框反色期间一律整框重画。点先画、后反色，和原实现同序，
+            // 所以按下时点也会跟着反色。
+            if (force || !st.valid || st.inv != inv || inv) {
+                rect_clear(bx, 30, 32, 32);
+                rect_outline(bx, 30, 32, 32);
+                rect_filled(lx - 1, ly - 1, 3, 3);
+                if (inv) rect_invert(bx, 30, 32, 32);
+                st.inv = inv;
+                st.valid = true;
+            } else if (st.x != lx || st.y != ly) {
+                // 点永远夹在框内（lx-1 ≥ bx+1、lx+1 ≤ bx+30），擦旧点碰不到边框
+                rect_clear(st.x - 1, st.y - 1, 3, 3);
+                rect_filled(lx - 1, ly - 1, 3, 3);
+            } else {
+                continue;   // 点没动：这块一个像素都不碰
+            }
+            st.x = (int8_t)lx;
+            st.y = (int8_t)ly;
+        }
+    }
 
-        // L2/R2 analog trigger bars (vertical, fill from bottom). L2 sits
-        // just right of the shifted left stick box.
+    // ---- 区域 3：L2/R2 模拟量条（垂直，从底部填充）----
+    if (force || h_bar != sig_last[2]) {
+        sig_last[2] = h_bar;
+        rect_clear(kContentX + 32, 33, 4, 29);
         rect_outline(kContentX + 32, 33, 4, 29);
         const int l2_fill = (interrupt_in_data[4] * 27) / 255;
         if (l2_fill > 0) rect_filled(kContentX + 33, 61 - l2_fill, 2, l2_fill);
+        rect_clear(92, 33, 4, 29);
         rect_outline(92, 33, 4, 29);
         const int r2_fill = (interrupt_in_data[5] * 27) / 255;
         if (r2_fill > 0) rect_filled(93, 61 - r2_fill, 2, r2_fill);
+    }
 
+    // ---- 区域 4：十字键 + 面键 + L1/R1 ----
+    if (force || h_btn != sig_last[3]) {
+        sig_last[3] = h_btn;
+        rect_clear(42, 30, 50, 27);     // x=42..91, y=30..56（把这一整块擦干净再画）
         const uint8_t b7 = interrupt_in_data[7];
         const uint8_t b8 = interrupt_in_data[8];
 
@@ -850,8 +1086,10 @@ __attribute__((noinline)) void render_screen() {
             if (on) rect_filled(fcx + dx - 2, fcy + dy - 2, 5, 5);
             else    rect_outline(fcx + dx - 2, fcy + dy - 2, 5, 5);
         };
-        // shift face buttons right so they don't collide with d-pad
-        const int fcx_off = 18;
+        // Shift face buttons right so they don't collide with the d-pad — but
+        // only by 16: at 18 the ○ square's right column (x=92) merged with the
+        // R2 bar's left outline (also x=92).
+        const int fcx_off = 16;
         sq(fcx_off + 0,  -8, b7 & 0x80); // Triangle
         sq(fcx_off + 8,   0, b7 & 0x40); // Circle
         sq(fcx_off + 0,   8, b7 & 0x20); // Cross
@@ -860,11 +1098,6 @@ __attribute__((noinline)) void render_screen() {
         // L1 bar shifted to sit between the L2 trigger column and the d-pad.
         if (b8 & 0x01) rect_filled(42, 30, 8, 3);  else rect_outline(42, 30, 8, 3);  // L1
         if (b8 & 0x02) rect_filled(80, 30, 12, 3); else rect_outline(80, 30, 12, 3); // R1
-    } else {
-        draw_text(kContentX, 14, "Pair your DualSense:");
-        draw_text(kContentX, 26, "1. Hold Create + PS");
-        draw_text(kContentX, 36, "2. Wait for light bar");
-        draw_text(kContentX, 46, "   to flash blue");
     }
 
     flush_fb();
@@ -907,6 +1140,10 @@ __attribute__((noinline)) void render_screen_rssi() {
 // D-pad up/down. No cursor — there's nothing to select.
 int   diag_scroll = 0;
 uint8_t diag_last_dpad = 8; // edge-trigger N/E/S/W like settings_handle_input
+// Rows on screen at once — used both for the render loop and for the scroll
+// clamp in diag_handle_input(), which screen_input_tick() calls every loop
+// iteration (the render path only runs at 10 Hz).
+constexpr int kDiagVisible = 5;
 
 // Per-second rates shown on the diag screen, shared across format_diag_row's
 // rate-based rows so they stay in sync.
@@ -980,7 +1217,8 @@ void sample_diag_rates() {
 
 // Row list ordered by relevance: always-useful at top, parked-mic-investigation
 // data at bottom. To add a row, bump kNumDiagRows and add a case.
-constexpr int kNumDiagRows = 11;
+//   0 Up   1 BT   2/3 Loop0/Loop1   4 host02   5 trig   6-9 速率  10-12 麦克风
+constexpr int kNumDiagRows = 13;
 __attribute__((noinline))
 void format_diag_row(int idx, char* line, size_t n) {
     switch (idx) {
@@ -996,34 +1234,54 @@ void format_diag_row(int idx, char* line, size_t n) {
             snprintf(line, n, "BT: %s", bt_is_connected() ? "connected" : "waiting");
             break;
         case 2:
+        case 3: {
+            // 主循环抖动（loop_probe.h）：最近一个 1 s 窗口内的最大轮间隔 + 循环频率。
+            // Loop0 = core0 转发主循环（USB/BT/OLED/灯条），Loop1 = core1 音频自旋环。
+            // "Loop0 41k/s 2100us" = 那 1 s 里最坏的一轮卡了 2.1 ms。
+            // 参考值：正常空闲档 max 是个位数~几十 µs；OLED 刷屏那一拍约 1 ms；
+            // config_save 的 flash 擦写、CPU 屏进屏时的频率计忙等会有几十 ms 尖峰。
+            // core1 有音频时天然是"一轮一次 opus 编/解码"，最大值本来就大。
+            const int      core   = idx - 2;
+            const uint32_t max_us = g_loop_max_us[core];
+            const uint32_t hz     = g_loop_hz[core];
+            char rate[10];
+            if (hz >= 1000) snprintf(rate, sizeof rate, "%luk/s", (unsigned long)(hz / 1000));
+            else            snprintf(rate, sizeof rate, "%lu/s",  (unsigned long)hz);
+            if (max_us >= 10000)   // ≥10 ms 用 ms 显示，保证行宽 ≤19 字符
+                snprintf(line, n, "Loop%d %s %lums", core, rate, (unsigned long)(max_us / 1000));
+            else
+                snprintf(line, n, "Loop%d %s %luus", core, rate, (unsigned long)max_us);
+            break;
+        }
+        case 4:
             snprintf(line, n, "host02: %lu", (unsigned long)host_out02_total());
             break;
-        case 3:
+        case 5:
             snprintf(line, n, "trig %lu / tx %lu",
                      (unsigned long)host_out02_trig_allow(),
                      (unsigned long)host_out02_to_bt());
             break;
-        case 4:
+        case 6:
             snprintf(line, n, "BT31 in: %lu/s", (unsigned long)g_diag_rates.bt31_rate);
             break;
-        case 5:
+        case 7:
             snprintf(line, n, "USB aud: %lu/s", (unsigned long)g_diag_rates.usb_rate);
             break;
-        case 6:
+        case 8:
             snprintf(line, n, "BT32 out: %lu/s", (unsigned long)g_diag_rates.bt_rate);
             break;
-        case 7:
+        case 9:
             snprintf(line, n, "Mic in: %lu/s", (unsigned long)g_diag_rates.mic_rate);
             break;
-        case 8:
+        case 10:
             snprintf(line, n, "Mic dec=%ld w=%u",
                      (long)audio_mic_last_decoded(),
                      (unsigned)audio_mic_last_wrote());
             break;
-        case 9:
+        case 11:
             snprintf(line, n, "Mic fail: %lu", (unsigned long)audio_mic_decode_failures());
             break;
-        case 10: {
+        case 12: {
             // Auto-haptics real usage: peak of the derived waveform (0-127).
             // Reads 0 while Fallback yields to native haptics or audio is silent.
             // Any non-zero output counts as active.
@@ -1052,23 +1310,57 @@ void diag_handle_input(int visible) {
 }
 
 __attribute__((noinline)) void render_screen_diag() {
-    fb_clear();
-    draw_text(kContentX, 0, "Diagnostics");
+    // 局部刷新：每行缓存"上次画出来的字符串 + 那时的 y"，只有内容或位置变了的行
+    // 才擦掉重画。这一屏绝大多数帧只有"运行时间"那一行在动（1 秒一次），其余行
+    // 的字符串一模一样 —— 整屏重画纯属浪费。
+    // 行文本区只占 x=6..118（19 字符），右侧 x=120..127 的滚动标记单独一块，所以
+    // 行重画不会碰到标记。
+    static uint32_t seen_gen = 0;
+    static char last_row[kDiagVisible][20];
+    static int  last_y[kDiagVisible] = {0};
+    static bool row_valid[kDiagVisible] = {false};
+    static uint8_t last_markers = 0xFF;   // bit0 = 上箭头, bit1 = 下箭头（0xFF = 未画）
+
+    const bool force = (seen_gen != g_fb_generation);
+    seen_gen = g_fb_generation;
+    if (force) {
+        fb_clear();
+        draw_text(kContentX, 0, "Diagnostics");
+        for (int i = 0; i < kDiagVisible; i++) row_valid[i] = false;
+        last_markers = 0xFF;
+    }
 
     sample_diag_rates();
-    constexpr int kVisible = 5;
-    diag_handle_input(kVisible);
+    // Input is sampled by screen_input_tick() every loop iteration, not here.
 
-    char line[28];
-    for (int i = 0; i < kVisible && diag_scroll + i < kNumDiagRows; i++) {
-        format_diag_row(diag_scroll + i, line, sizeof(line));
-        draw_text(kContentX, 9 + i * 9, line);
+    // 19 characters max (= 113 px, ends at x=118): keeps even the unbounded
+    // counters ("trig 4294967295 / tx ...") from running under the scroll
+    // markers at x=120. snprintf truncates; rows are informational.
+    char line[20];
+    for (int i = 0; i < kDiagVisible; i++) {
+        const int row = diag_scroll + i;
+        if (row < kNumDiagRows) format_diag_row(row, line, sizeof(line));
+        else                    line[0] = '\0';
+        const int y = 9 + i * 9;
+        if (row_valid[i] && last_y[i] == y && strcmp(last_row[i], line) == 0) continue;
+        rect_clear(kContentX, y, 113, 9);   // 行带（7 px 字形 + 行距），不碰右侧标记
+        if (line[0]) draw_text(kContentX, y, line);
+        memcpy(last_row[i], line, sizeof(line));
+        last_y[i] = y;
+        row_valid[i] = true;
     }
 
     // Scroll indicators along the right edge, adjacent to the visible content
     // rather than in a footer — keeps the bottom row available for content.
-    if (diag_scroll > 0)                       draw_text(120, 9,  "^");
-    if (diag_scroll + kVisible < kNumDiagRows) draw_text(120, 45, "v");
+    // 只在"该显示哪几个箭头"变化时重画（不是只看滚动位置）。
+    const uint8_t markers = (uint8_t)((diag_scroll > 0 ? 1 : 0) |
+                                      (diag_scroll + kDiagVisible < kNumDiagRows ? 2 : 0));
+    if (force || markers != last_markers) {
+        rect_clear(120, 9, 8, 45);
+        if (markers & 1) draw_text(120, 9,  "^");
+        if (markers & 2) draw_text(120, 45, "v");
+        last_markers = markers;
+    }
 
     flush_fb();
 }
@@ -1142,7 +1434,7 @@ void triggers_handle_input() {
 }
 
 __attribute__((noinline)) void render_screen_triggers() {
-    triggers_handle_input();
+    // △ cycling is sampled by screen_input_tick() every loop iteration, not here.
     fb_clear();
     draw_text(kContentX, 0, "Trigger Test");
 
@@ -1376,6 +1668,10 @@ const char* lb_mode_tag(int mode) {
     }
 }
 
+// Defined next to lightbar_service() below (it needs lightbar_compute_mode);
+// used here to refresh lb_r/g/b before a favorite save.
+void lightbar_update_color();
+
 // R1 rising edge on Lightbar cycles lb_mode. Used to be KEY1; that moved
 // to back-nav. Triangle on this screen stays as "save current RGB to
 // favorite slot 0" (the existing favorite-save UX), so R1 is the next
@@ -1390,10 +1686,32 @@ void lightbar_handle_input() {
         lb_dirty = true; // persisted on leaving the Lightbar screen
     }
     lb_last_buttons = btns;
+
+    // Face button rising edge -> save current color to slot 0..3. Lived in
+    // render_screen_lightbar() until the per-screen input moved out of the
+    // 10 Hz render path (see screen_input_tick).
+    const uint8_t face = interrupt_in_data[7] & 0xF0;
+    const uint8_t pressed = face & ~lb_last_face;
+    lb_last_face = face;
+    int save_slot = -1;
+    if      (pressed & 0x80) save_slot = 0; // Triangle
+    else if (pressed & 0x40) save_slot = 1; // Circle
+    else if (pressed & 0x20) save_slot = 2; // Cross
+    else if (pressed & 0x10) save_slot = 3; // Square
+    if (save_slot >= 0) {
+        // This runs before lightbar_service() in oled_loop, so lb_r/g/b can be
+        // up to one frame stale — recompute before capturing them.
+        lightbar_update_color();
+        lb_fav_r[save_slot] = lb_r;
+        lb_fav_g[save_slot] = lb_g;
+        lb_fav_b[save_slot] = lb_b;
+        lb_dirty = true; // persisted on leaving the Lightbar screen
+    }
 }
 
 __attribute__((noinline)) void render_screen_lightbar() {
-    lightbar_handle_input();
+    // Input (R1 mode cycle, face-button favorite save) is sampled by
+    // screen_input_tick() every loop iteration, not here.
     fb_clear();
     draw_text(kContentX, 0, "Lightbar");
     draw_text(86, 0, lb_mode_tag(lb_mode));
@@ -1410,22 +1728,6 @@ __attribute__((noinline)) void render_screen_lightbar() {
         rect_outline(kContentX,  by, 38, bh); int rf = (lb_r * 34) / 255; if (rf > 0) rect_filled(kContentX + 2,  by + 2, rf, bh - 4);
         rect_outline(48, by, 38, bh); int gf = (lb_g * 34) / 255; if (gf > 0) rect_filled(50, by + 2, gf, bh - 4);
         rect_outline(90, by, 38, bh); int bf = (lb_b * 34) / 255; if (bf > 0) rect_filled(92, by + 2, bf, bh - 4);
-
-        // Face button rising-edge -> save current color to slot 0..3
-        const uint8_t face = interrupt_in_data[7] & 0xF0;
-        const uint8_t pressed = face & ~lb_last_face;
-        lb_last_face = face;
-        int save_slot = -1;
-        if      (pressed & 0x80) save_slot = 0; // Triangle
-        else if (pressed & 0x40) save_slot = 1; // Circle
-        else if (pressed & 0x20) save_slot = 2; // Cross
-        else if (pressed & 0x10) save_slot = 3; // Square
-        if (save_slot >= 0) {
-            lb_fav_r[save_slot] = lb_r;
-            lb_fav_g[save_slot] = lb_g;
-            lb_fav_b[save_slot] = lb_b;
-            lb_dirty = true; // persisted on leaving the Lightbar screen
-        }
 
         draw_text(kContentX, 38, "Sv:T=0 C=1 X=2 S=3");
         const char* hint =
@@ -1507,8 +1809,12 @@ void lightbar_compute_mode(int mode, uint32_t now_ms) {
 // send_lightbar_color (idle: every frame; during audio: ~10 Hz), and turns on
 // g_lightbar_override — main.cpp's 0x02 forward then clears AllowLedColor+RGB
 // so the host's writes can't stomp it.
+// Recompute lb_r/lb_g/lb_b (and g_lightbar_override) for the current state —
+// no BT traffic. Split out of lightbar_service() so lightbar_handle_input(),
+// which runs earlier in oled_loop, can capture a fresh color when saving a
+// favorite instead of the previous frame's.
 __attribute__((noinline))
-void lightbar_service() {
+void lightbar_update_color() {
     if (!bt_is_connected()) { g_lightbar_override = false; return; }
     const uint32_t now_ms = time_us_32() / 1000;
 
@@ -1533,6 +1839,14 @@ void lightbar_service() {
     }
 
     g_lightbar_override = true;
+}
+
+// Pushes the color computed by lightbar_update_color() to the controller.
+// Runs once per rendered frame from oled_loop.
+__attribute__((noinline))
+void lightbar_service() {
+    lightbar_update_color();
+    if (!g_lightbar_override) return; // HOST mode / no controller: LED isn't ours
     // 反向移植后音频帧不再携带 state[]（上游 0x39 双包只装 haptics+speaker），
     // 固件持有的灯条颜色改为自己直发：空闲时按帧率直发；音频播放中降到 ~10 Hz，
     // 避免挤占音频包节奏（0x39 双包比旧 0x36 单包省一半包量，10 Hz 的额外 0x31
@@ -1688,13 +2002,13 @@ void settings_handle_input() {
                 settings_local = get_config();
                 lightbar_load_config(); // refresh RAM lightbar state (no reboot here)
                 settings_dirty = false;
-                settings_save_status = "Reset!";
+                settings_set_status("Reset!");
             } else {
-                settings_save_status = "Reset FAIL";
+                settings_set_status("Reset FAIL");
             }
         } else {
             bt_wipe_all_slots();
-            settings_save_status = "Slots wiped!";
+            settings_set_status("Slots wiped!");
         }
     }
     if (!tri_now && tri_prev) {
@@ -1709,8 +2023,11 @@ void settings_handle_input() {
                 || (get_config().ps_shortcut_enabled != settings_local.ps_shortcut_enabled);
 #endif
             set_config(settings_local);
-            settings_save_status = config_save() ? "Saved!" : "Save FAIL";
-            if (settings_save_status[0] == 'S' && settings_save_status[1] == 'a') {
+            // 原来靠比较状态串前缀（"Sa..."）判断成功 —— 但 "Save FAIL" 也匹配，
+            // 保存失败时同样会清 dirty 并触发重挂载。改成直接用返回值。
+            const bool saved = config_save();
+            settings_set_status(saved ? "Saved!" : "Save FAIL");
+            if (saved) {
                 settings_dirty = false;
                 // USB 序列号开关只在主机重新枚举时被读到 → 保存后主动重挂载一次
                 // （与 web 工具 0x03 指令同一条路径；会给主机一个正常的重连脉冲）
@@ -1772,15 +2089,12 @@ __attribute__((noinline)) void render_screen_settings() {
         settings_local = get_config();
         settings_init_done = true;
     }
-    settings_handle_input();
+    // Input is sampled by screen_input_tick() every loop iteration, not here.
 
     fb_clear();
     char buf[24];
     snprintf(buf, sizeof(buf), "Settings %s", settings_dirty ? "(*)" : "   ");
     draw_text(kContentX, 0, buf);
-    if (settings_save_status[0]) {
-        draw_text(86, 0, settings_save_status);
-    }
 
     constexpr int kVisible = 5;
     int top = 0;
@@ -1791,8 +2105,16 @@ __attribute__((noinline)) void render_screen_settings() {
         draw_text(kContentX, 9 + i * 9, line);
     }
 
-    draw_text(kContentX, 56, kSetItems[settings_sel].hint ? kSetItems[settings_sel].hint
-                                                           : "DP nav/adj  Tri=save");
+    // Footer row: a recent save/reset result takes over while live, otherwise
+    // the selected item's hint (or the generic nav hint).
+    const char* footer = kSetItems[settings_sel].hint;
+    if (settings_save_status[0]
+        && (int32_t)((uint32_t)time_us_32() - settings_status_until_us) < 0) {
+        footer = settings_save_status;
+    } else if (!footer) {
+        footer = "DP nav/adj  Tri=save";
+    }
+    draw_text(kContentX, 56, footer);
     flush_fb();
 }
 
@@ -1859,19 +2181,17 @@ void slots_handle_input() {
 }
 
 __attribute__((noinline)) void render_screen_slots() {
-    slots_handle_input();
+    // Input is sampled by screen_input_tick() every loop iteration, not here.
     if (slots_cursor < 0) slots_cursor = bt_get_slot();
 
     fb_clear();
     char hdr[24];
     const int active = bt_get_slot();
     const bool conn = bt_is_connected();
-    snprintf(hdr, sizeof(hdr), "Slots         [s%d %s]", active, conn ? "ON" : "--");
+    // 20 chars = ends at x=124. The old spacing made the header 21 chars, which
+    // clipped the trailing ']' — and the status draw at x=80 painted over it.
+    snprintf(hdr, sizeof(hdr), "Slots        [s%d %s]", active, conn ? "ON" : "--");
     draw_text(kContentX, 0, hdr);
-
-    if (slots_status[0] && (uint32_t)time_us_32() < slots_status_until_us) {
-        draw_text(80, 0, slots_status);
-    }
 
     for (int i = 0; i < kNumSlots; i++) {
         char line[28];
@@ -1888,7 +2208,11 @@ __attribute__((noinline)) void render_screen_slots() {
         draw_text(kContentX, 9 + i * 9, line);
     }
 
-    draw_text(kContentX, 56, "Tri=switch Sq hold=wipe");
+    // Footer row carries the switch/wipe result while it is live; the hint it
+    // replaces was also 2 chars too wide for the panel.
+    const bool status_live = slots_status[0]
+        && (int32_t)((uint32_t)time_us_32() - slots_status_until_us) < 0;
+    draw_text(kContentX, 56, status_live ? slots_status : "Tri=sw Sq hold=wipe");
     flush_fb();
 }
 
@@ -1908,7 +2232,35 @@ void boot_splash() {
     draw_text(cx_for(l2), 30, l2);
     draw_text(cx_for(l3), 44, l3);
     flush_fb();
-    sleep_ms(1500);
+    // Hold the splash for ~1.5 s WITHOUT blocking: oled_init() runs before the
+    // main loop, so a sleep here delayed tud_task() — and with it USB
+    // enumeration — by the same amount. The SH1107 keeps the image in its own
+    // GDDRAM, so oled_loop() just skips rendering until this deadline.
+    splash_deadline_us = fast_now_us() + 1500000u;   // 32 位 µs，见 fast_time.h
+    splash_done = false;
+}
+
+// Per-screen input sampling. Called every oled_loop() iteration — NOT from the
+// renderers, which only run once per kFrameUs (10 Hz): sampling there dropped
+// any controller tap shorter than a frame (a quick D-pad nudge, a △ press).
+// Each handler keeps its own edge-detection state, so a higher sample rate only
+// makes them more reliable. Only the screen on display is sampled.
+void screen_input_tick() {
+    // Only while the panel is actually awake. With "CtrlWake" off the dim/off
+    // tiers deliberately ignore controller input (only KEY0/KEY1 wake it), and
+    // running the handlers there would let a button press silently change a
+    // setting or switch a slot behind a blank panel. oled_power_state lags by
+    // at most one frame, so a press that wakes the panel still registers — the
+    // same one-frame latency the old render-path sampling had.
+    if (oled_power_state != OLED_ACTIVE) return;
+    switch (current_screen) {
+        case kScreenSlots:    slots_handle_input();            break;
+        case kScreenLightbar: lightbar_handle_input();         break;
+        case kScreenTriggers: triggers_handle_input();         break;
+        case kScreenDiag:     diag_handle_input(kDiagVisible); break;
+        case kScreenSettings: settings_handle_input();         break;
+        default: break;
+    }
 }
 
 } // namespace
@@ -1924,6 +2276,21 @@ void oled_init() {
 
     gpio_init(kPinKey0); gpio_set_dir(kPinKey0, GPIO_IN); gpio_pull_up(kPinKey0);
     gpio_init(kPinKey1); gpio_set_dir(kPinKey1, GPIO_IN); gpio_pull_up(kPinKey1);
+
+    // 位反转查表（见 rev_lut）；同时让显存镜像失效 —— 上电时 GDDRAM 内容未定义，
+    // 第一帧必须整屏发一次。此后 0xAE/0xAF 开关屏不动显存，无需再失效。
+    for (int i = 0; i < 256; i++) rev_lut[i] = reverse_byte((uint8_t)i);
+    fb_shadow_valid = false;
+
+    // 字形转置表（见 font_rows）：列存字库 → 每行 5 bit
+    for (int c = 0; c < 95; c++) {
+        for (int row = 0; row < kFontH; row++) {
+            uint8_t bits = 0;
+            for (int col = 0; col < kFontW; col++)
+                if (kFont5x7[c][col] & (1u << row)) bits |= (uint8_t)(1u << (kFontW - 1 - col));
+            font_rows[c][row] = bits;
+        }
+    }
 
     hw_reset();
     sh1107_init();
@@ -1972,8 +2339,18 @@ void render_dim_pulse(uint32_t dim_elapsed_us) {
 
 void oled_loop() {
     handle_buttons();
-    const uint32_t now = time_us_32();
+    const uint32_t now = fast_now_us();   // 每轮调用：省掉 time_us_32 的函数调用（见 fast_time.h）
     rumble_burst_tick(now);
+    // Boot splash still on the panel: keep the main loop (USB / BT / audio)
+    // running and skip everything else until the deadline passes.
+    // （常见路径下 splash_done 已经是 true，只剩一次 bool 判断 —— 见 fast_time.h）
+    if (!splash_done) {
+        if ((int32_t)(fast_now_us() - splash_deadline_us) < 0) return;
+        splash_done = true;
+    }
+    // Controller input for the current screen is sampled every iteration;
+    // only rendering is paced by kFrameUs below.
+    screen_input_tick();
     if ((now - last_render_us) < kFrameUs) return;
     last_render_us = now;
     // Track charge progress every frame — before the power-ladder early-returns
@@ -2030,12 +2407,14 @@ void oled_loop() {
         if (oled_power_state != OLED_OFF) {
             cmd(0xAE);
             oled_power_state = OLED_OFF;
+            g_fb_generation++; // 面板要黑了：醒来时局部刷新的屏必须整屏重画
         }
         return; // panel is off, nothing to draw
     }
     if (oled_power_state == OLED_OFF) cmd(0xAF); // wake panel before drawing
     if (dim_enabled && idle > dim_us) {
         sh1107_set_contrast(kDimContrast);
+        if (oled_power_state != OLED_DIM) g_fb_generation++; // 呼吸点会清掉 fb
         oled_power_state = OLED_DIM;
         render_dim_pulse((uint32_t)(idle - dim_us));
         return; // skip the regular per-screen render path
@@ -2048,6 +2427,8 @@ void oled_loop() {
     // caches its frequency-counter measurement here).
     static int last_rendered_screen = -1;
     const bool screen_entered = (current_screen != last_rendered_screen);
+    // 切屏 = fb 被别的屏画满 → 做局部刷新的屏下次必须整屏重画
+    if (screen_entered) g_fb_generation++;
 
     // Leaving Trigger Test in either direction → reset the adaptive
     // trigger preset to OFF and push it to the controller. Otherwise
