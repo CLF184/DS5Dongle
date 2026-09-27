@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "config.h"
+#include "fast_time.h"   // 每轮都跑的 tick 用内联 µs 读数（见该文件注释）
 #include "pico/cyw43_arch.h"
 #include "pico/time.h"
 
@@ -14,13 +15,16 @@ extern uint8_t interrupt_in_data[63];
 
 namespace {
 
-constexpr uint64_t REPORT_STALE_US = 2'000'000;  // assume disconnected if no report for 2 s
-constexpr uint64_t BLINK_PERIOD_US =   500'000;  // 1 Hz, 50% duty
+constexpr uint32_t REPORT_STALE_US = 2'000'000;  // assume disconnected if no report for 2 s
+constexpr uint32_t BLINK_PERIOD_US =   500'000;  // 1 Hz, 50% duty
 constexpr uint8_t  THRESHOLD_LEVEL = 1;          // PowerPercent <= 1 (i.e. <= 10%)
 constexpr uint8_t  POWER_STATE_DISCHARGING = 0x0;
 
-uint64_t last_report_us = 0;
-uint64_t last_toggle_us = 0;
+// 32 位 µs（与 fast_now_us() 同一时钟）：这里的窗口只有 2 s / 500 ms，远小于
+// 71.6 分钟的回绕周期，无符号差值比较天然安全。原来每轮一次 time_us_64()（flash
+// 调用 + 64 位读）。
+uint32_t last_report_us = 0;
+uint32_t last_toggle_us = 0;
 bool     blinking       = false;
 bool     led_state      = false;
 
@@ -34,7 +38,7 @@ void battery_led_init(void) {
 }
 
 void battery_led_note_report(void) {
-    last_report_us = time_us_64();
+    last_report_us = fast_now_us();
 }
 
 void battery_led_on_disconnect(void) {
@@ -50,8 +54,8 @@ void battery_led_on_disconnect(void) {
 }
 
 void battery_led_tick(void) {
-    const uint64_t now = time_us_64();
-    if (last_report_us == 0 || (now - last_report_us) >= REPORT_STALE_US) {
+    const uint32_t now = fast_now_us();
+    if (last_report_us == 0 || (uint32_t)(now - last_report_us) >= REPORT_STALE_US) {
         // No fresh data — bt.cpp owns the LED while disconnected. If we
         // were mid-blink when the report went stale, force the LED off
         // so it doesn't freeze in whichever half-cycle it was in.
@@ -77,7 +81,7 @@ void battery_led_tick(void) {
             cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, true);
             return;
         }
-        if ((now - last_toggle_us) >= BLINK_PERIOD_US) {
+        if ((uint32_t)(now - last_toggle_us) >= BLINK_PERIOD_US) {
             led_state = !led_state;
             last_toggle_us = now;
             cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_state);

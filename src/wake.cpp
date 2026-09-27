@@ -253,14 +253,14 @@ void wake_on_bt_disconnect(void) {
 }
 
 void wake_task(void) {
-    const uint64_t now = time_us_64();
-
     // Commit the deferred controller disconnect once we have stayed suspended past the debounce
     // window (a genuine host sleep/shutdown). Runs regardless of enable_wake -- it is a
     // battery-save, not part of the wake-UP path. A transient hub suspend will already have
     // been cancelled by tud_resume_cb / tud_mount_cb before this fires.
+    // 先看标志、需要时才取时间：原来这里是每轮无条件一次 time_us_64()（flash 调用 +
+    // 64 位读），而绝大多数轮次两个标志都不成立。
     if (suspend_at_us != 0 && host_suspended &&
-        now - suspend_at_us >= WAKE_DISCONNECT_DEBOUNCE_US) {
+        time_us_64() - suspend_at_us >= WAKE_DISCONNECT_DEBOUNCE_US) {
         bt_disconnect();
         suspend_at_us = 0;
         WAKE_DBG("suspend debounce elapsed -> bt_disconnect()");
@@ -268,6 +268,8 @@ void wake_task(void) {
 
     // The wake-UP FSM below only runs when wake is enabled.
     if (!get_config().enable_wake) return;
+
+    const uint64_t now = time_us_64();   // FSM 计时（只有 wake 打开时才走到这里）
 
     critical_section_enter_blocking(&wake_cs);
     const wake_state_t s = state;

@@ -7,6 +7,7 @@
 #include <cstdio>
 
 #include "bt.h"
+#include "fast_time.h"   // 每轮的"到点了吗"用内联 µs 读数（见该文件注释）
 #include "pico/time.h"
 #include "pico/flash.h"
 #include "hardware/gpio.h"
@@ -27,7 +28,7 @@ static int button_fsm = 0;
 static int button_press_samples = 0;
 static int button_wait_samples = 0;
 static int button_click_count = 0;
-static uint32_t button_last_check_ms = 0;
+static uint32_t button_last_check_us = 0;
 
 // Read BOOTSEL by briefly floating the QSPI CSn line. Must run with both cores
 // in a known-safe state - if core 1 does an XIP read while CSn is floating it
@@ -93,9 +94,12 @@ void button_check() {
     // No connection gate: safe to poll during audio because button_read_bootsel()
     // uses flash_safe_execute(), which parks core1 (the audio core) for the QSPI
     // CSn float -- see flash_safe_execute_core_init() and PICO_FLASH_ASSUME_CORE1_SAFE=0.
-    uint32_t now = to_ms_since_boot(get_absolute_time());
-    if (now - button_last_check_ms < 100) return;
-    button_last_check_ms = now;
+    // 100 ms 门控用 µs 直比（32 位无符号差值，回绕安全）：原来每轮都要做一次
+    // to_ms_since_boot(get_absolute_time())，即 flash 调用 + 64 位读 + ÷1000，
+    // 开机 71.6 分钟后那条 ÷1000 还会退化成 __aeabi_uldivmod 库调用。见 fast_time.h。
+    const uint32_t now = fast_now_us();
+    if ((uint32_t)(now - button_last_check_us) < 100000u) return;
+    button_last_check_us = now;
 
     bt_blacklist_persist_if_dirty();
 
