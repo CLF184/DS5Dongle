@@ -27,6 +27,7 @@
 #include "pico/platform.h"
 #include "config.h"
 #include "auto_haptics.h"
+#include "loop_probe.h"   // 主循环抖动探针（Diag 屏 "Loop1" 行）
 
 #define INPUT_CHANNELS    4
 #define OUTPUT_CHANNELS   2
@@ -623,9 +624,16 @@ void __not_in_flash_func(core1_entry)() {
         printf("[Audio] OpusDecoder create failed\n");
     }
 
+    static LoopProbe probe_core1;
+
     while (true) {
+        // 抖动探针（core1）：量相邻两轮之间最大间隔。空闲时是 ~10 µs 的自旋，
+        // 有音频时一轮 = 一次 opus 编/解码，被 core0 的 flash 擦写停车则会出现
+        // 几十 ms 的尖峰 —— 这些都会体现在 Diag 屏的 Loop1 行。见 loop_probe.h。
+        loop_probe_tick(probe_core1, 1);
+
         bool work_done = false;
-        
+
         // Only enter processing if data is actually waiting.
         // This avoids constantly acquiring queue locks (spinlocks) when idle,
         // which would otherwise thrash the RP2350 system bus and starve Core 0.

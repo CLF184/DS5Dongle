@@ -34,9 +34,14 @@
 #include "battery_led.h"
 #endif
 #include "oled.h"
+#include "loop_probe.h"   // 主循环抖动探针（Diag 屏 "LoopN" 行）
 
 // Pico SDK speciifically for waiting on conditions
 #include "pico/critical_section.h"
+
+// 主循环抖动探针的共享槽位：各核只写自己那一格，见 loop_probe.h。
+volatile uint32_t g_loop_max_us[2] = {0, 0};
+volatile uint32_t g_loop_hz[2] = {0, 0};
 
 uint8_t reportSeqCounter = 0;
 uint8_t packetCounter = 0;
@@ -546,7 +551,13 @@ int main() {
     watchdog_enable(1000, true);
 #endif
 
+    static LoopProbe probe_core0;
+
     while (1) {
+        // 主循环抖动探针：放循环体最顶部，量的是"上一轮开头 → 本轮开头"的完整周期，
+        // 循环里任何一处阻塞都会被记进 Loop0 的 max。见 loop_probe.h。
+        loop_probe_tick(probe_core0, 0);
+
 #if !ENABLE_SERIAL
         watchdog_update();
 #endif
@@ -563,7 +574,13 @@ int main() {
 #if ENABLE_BATT_LED
         battery_led_tick();
 #endif
-        button_check();
+        // button_check();   // 停用：它每 100 ms 走一次 flash_safe_execute（停 core1 +
+        //                   // 关 core0 中断 + 回调里 1000 次忙等）只为读 BOOTSEL，
+        //                   // 实测平均 ~1 µs/轮、尖峰 90 µs。副作用有二：BOOTSEL 手势
+        //                   // 全停（单击切手柄/配对、双击重启、三击进 BOOTSEL、长按清配对）；
+        //                   // 黑名单的延迟落盘（bt_blacklist_persist_if_dirty）也随之
+        //                   // 失去唯一驱动者 —— 需要的话把它挪到主循环里单独调一次。
+        //                   // 恢复：取消本行注释即可。
         bt_inquiring_led();
         dse_task();
     }
