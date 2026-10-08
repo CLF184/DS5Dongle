@@ -113,6 +113,8 @@ add_executable(ds5-bridge
         src/usb_descriptors.cpp
         src/main.cpp
         src/usb.cpp
+        src/xbox_protocol.cpp
+        src/xbox_usb.cpp
         src/audio.cpp
         src/auto_haptics.cpp
         src/bt.cpp
@@ -372,6 +374,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 # Add any user requested libraries
 target_link_libraries(ds5-bridge
         pico_stdlib
+        pico_rand
         pico_multicore
         hardware_watchdog
         hardware_timer

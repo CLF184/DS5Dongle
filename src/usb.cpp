@@ -10,6 +10,7 @@
 #include "config.h"
 #include "utils.h"
 #include "usb.h"
+#include "xbox_usb.h"
 #include "wake.h"
 #include "audio.h"
 #include "pico/time.h"
@@ -24,6 +25,8 @@ uint8_t usb_keyboard_instance() { return usb_keyboard_only ? 0 : 1; }
 void usb_reconnect(bool keyboard_only) {
     wake_note_usb_reconnect();
     tud_disconnect();
+    xbox_usb_stop();
+    usb_xbox_mode = get_config().controller_mode == 3;
     usb_keyboard_only = keyboard_only;
     usb_reconfiguring = true;
     extern bool spk_active;

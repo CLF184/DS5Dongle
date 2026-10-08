@@ -102,7 +102,7 @@ void config_valid() {
         body->audio_buffer_length = 48;
         printf("[Config] haptics_buffer_length is invalid\n");
     }
-    if (body->controller_mode > 2) {
+    if (body->controller_mode > 3) {
         body->controller_mode = 2;
         printf("[Config] controller_mode is invalid\n");
     }

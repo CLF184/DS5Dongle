@@ -966,20 +966,28 @@ void bt_control_send(const uint8_t *data, uint16_t len) {
     }
 }
 
-void __not_in_flash_func(bt_write)(const uint8_t *data, const uint16_t len) {
-    if (hid_interrupt_cid == 0) return;
+bool __not_in_flash_func(bt_try_write)(const uint8_t *data, const uint16_t len) {
+    if (hid_interrupt_cid == 0) return false;
     static send_element packet{};
+    if (len < 4 || len + 1 > sizeof(packet.data)) return false;
     packet.len = len + 1;
     packet.data[0] = 0xA2;
     memcpy(packet.data + 1, data, len);
     fill_output_report_checksum(packet.data + 1, len);
 
     if (!queue_try_add(&send_fifo, &packet)) {
-        printf("[L2CAP bt_write] Error: Failed to add packet to send FIFO\n");
-        return;
+        return false;
     }
     if (queue_get_level(&send_fifo) == 1) {
         l2cap_request_can_send_now_event(hid_interrupt_cid);
+    }
+    return true;
+}
+
+void __not_in_flash_func(bt_write)(const uint8_t *data, const uint16_t len) {
+    if (hid_interrupt_cid == 0) return;
+    if (!bt_try_write(data, len)) {
+        printf("[L2CAP bt_write] Error: Failed to add packet to send FIFO\n");
     }
 }
 

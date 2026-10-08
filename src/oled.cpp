@@ -177,7 +177,7 @@ struct SetItem {
 static const char* const kOnOff[]    = {"off", "on"};
 static const char* const kPicoLed[]  = {"on", "off"};   // 字段是 disable_pico_led，反着显示
 static const char* const kPoll[]     = {"250Hz", "500Hz", "RT"};
-static const char* const kCtrl[]     = {"DS5", "DSE", "Auto"};
+static const char* const kCtrl[]     = {"DS5", "DSE", "Auto", "Xbox"};
 static const char* const kAutoHap[]  = {"Off", "Fallback", "Mix", "Replace"};
 static const char* const kAHLp[]     = {"80Hz", "160Hz", "250Hz", "400Hz"};
 static const char* const kMicSel[]   = {"auto", "Int", "Ext", "Off"};
@@ -192,7 +192,7 @@ static const SetItem kSetItems[] = {
     {"Pico LED", nullptr, nullptr, kPicoLed,   SK_BOOL, SF_PLAIN, 0,           ACT_NONE, CFG_OFF(disable_pico_led),      0, 0, 1, 1},
     {"Poll",     nullptr, nullptr, kPoll,      SK_NUM,  SF_PLAIN, SIF_WRAP,    ACT_NONE, CFG_OFF(polling_rate_mode),     0, 0, 2, 1},
     {"AudBuf",   nullptr, nullptr, nullptr,    SK_NUM,  SF_PLAIN, 0,           ACT_NONE, CFG_OFF(audio_buffer_length),   0, 16, 128, 4},
-    {"Ctrl",     nullptr, nullptr, kCtrl,      SK_NUM,  SF_PLAIN, SIF_WRAP,    ACT_NONE, CFG_OFF(controller_mode),       0, 0, 2, 1},
+    {"Ctrl",     nullptr, nullptr, kCtrl,      SK_NUM,  SF_PLAIN, SIF_WRAP,    ACT_NONE, CFG_OFF(controller_mode),       0, 0, 3, 1},
     {"AutoHap",  nullptr, nullptr, kAutoHap,   SK_NUM,  SF_PLAIN, SIF_WRAP,    ACT_NONE, CFG_OFF(auto_haptics_enable),   0, 0, 3, 1},
     {"AH Gain",  "%",     nullptr, nullptr,    SK_NUM,  SF_PLAIN, 0,           ACT_NONE, CFG_OFF(auto_haptics_gain),     0, 0, 200, 10},
     {"AH LP",    nullptr, nullptr, kAHLp,      SK_NUM,  SF_PLAIN, SIF_WRAP,    ACT_NONE, CFG_OFF(auto_haptics_lowpass),  0, 0, 3, 1},
@@ -1997,12 +1997,14 @@ void settings_handle_input() {
         && ((uint32_t)time_us_32() - settings_tri_press_us) >= kResetHoldUs) {
         settings_reset_triggered = true;
         if (kSetItems[settings_sel].act == ACT_RESET) {
+            const uint8_t previous_mode = get_config().controller_mode;
             config_default();
             if (config_save()) {
                 settings_local = get_config();
                 lightbar_load_config(); // refresh RAM lightbar state (no reboot here)
                 settings_dirty = false;
                 settings_set_status("Reset!");
+                if (previous_mode != get_config().controller_mode) usb_reconnect(false);
             } else {
                 settings_set_status("Reset FAIL");
             }
@@ -2015,6 +2017,7 @@ void settings_handle_input() {
         if (!is_hold_item && !settings_reset_triggered) {
             const bool sn_changed = ((get_config().enable_usb_sn != 0)
                                      != (settings_local.enable_usb_sn != 0));
+            const bool mode_changed = get_config().controller_mode != settings_local.controller_mode;
 #ifdef ENABLE_WAKE_HID
             // enable_wake / ps_shortcut_enabled 改变 USB 枚举面（bcdUSB 2.1 + BOS +
             // 键盘接口 / remote-wakeup 位），保存后必须重新枚举才生效。
@@ -2036,11 +2039,11 @@ void settings_handle_input() {
                     // 模式选择与 bt.cpp 的断连处理相同：wake 开且手柄没连 → 键盘专属
                     // 模式；否则正常全功能配置（保存时手柄必然连着，等效 false）。
                     usb_reconnect(get_config().enable_wake && !bt_is_connected());
-                } else if (sn_changed) {
+                } else if (sn_changed || mode_changed) {
                     usb_reconnect(false);
                 }
 #else
-                if (sn_changed) usb_reconnect(false);
+                if (sn_changed || mode_changed) usb_reconnect(false);
 #endif
             }
         }

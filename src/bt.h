@@ -28,6 +28,7 @@ void bt_set_scan_active();
 void dse_unlock_task();
 bool bt_dse_profiles_ready();
 void bt_write(const uint8_t *data, uint16_t len);
+bool bt_try_write(const uint8_t *data, uint16_t len);
 void bt_get_signal_strength(int8_t *rssi);
 void bt_rssi_request();                      // explicit refresh ask (10 Hz cap inside)
 std::vector<uint8_t> get_feature_data(uint8_t reportId,uint16_t len);

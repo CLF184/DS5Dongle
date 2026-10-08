@@ -29,6 +29,8 @@
 #include "usb.h"
 #include "bt.h"
 #include "slots.h"
+#include "xbox_usb.h"
+#include "xbox_protocol.h"
 
 #ifndef ENABLE_SERIAL
 #define ENABLE_SERIAL 0
@@ -136,11 +138,18 @@ tusb_desc_device_t desc_device =
 // Invoked when received GET DEVICE DESCRIPTOR
 // Application return pointer to descriptor
 uint8_t const *tud_descriptor_device_cb(void) {
+    const bool xbox = usb_xbox_mode && !usb_keyboard_only;
+    desc_device.idVendor = xbox ? xbox::vendor_id : 0x054c;
     desc_device.idProduct = ds_mode() ? 0x0CE6 : 0x0DF2;
+    if (xbox) desc_device.idProduct = xbox::product_id;
+    desc_device.bDeviceClass = xbox ? 0xff : (ENABLE_SERIAL ? TUSB_CLASS_MISC : 0);
+    desc_device.bDeviceSubClass = xbox ? 0x47 : (ENABLE_SERIAL ? MISC_SUBCLASS_COMMON : 0);
+    desc_device.bDeviceProtocol = xbox ? 0xd0 : (ENABLE_SERIAL ? MISC_PROTOCOL_IAD : 0);
     desc_device.iSerialNumber = get_config().enable_usb_sn ? 0x03 : 0x00;
     // USB 2.1 (so the host requests the BOS / MS OS 2.0 selective-suspend opt-in)
     // only when wake is enabled; plain USB 2.0 otherwise.
     desc_device.bcdUSB = get_config().enable_wake ? 0x0210 : 0x0200;
+    if (xbox) desc_device.bcdUSB = 0x0200;
     return reinterpret_cast<uint8_t const *>(&desc_device);
 }
 
@@ -450,6 +459,18 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
 #ifdef ENABLE_WAKE_HID
     if (usb_keyboard_only) return descriptor_keyboard_only;
 #endif
+    // Xbox is a standalone GIP device. Do not expose Sony audio or a second gamepad.
+    if (usb_xbox_mode) {
+        static uint8_t desc[] = {
+            9,2,32,0,1,1,0,0x80,250,
+            9,4,0,0,2,0xff,0x47,0xd0,0,
+            7,5,0x81,3,64,0,1,
+            7,5,0x01,3,64,0,1,
+        };
+        desc[24] = desc[31] = get_config().polling_rate_mode == 0 ? 4 :
+                               (get_config().polling_rate_mode == 1 ? 2 : 1);
+        return desc;
+    }
     auto bInterval = 0x01;
     switch (get_config().polling_rate_mode) {
         case 0:
@@ -963,6 +984,11 @@ static uint16_t _desc_str[60 + 1];
 uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
     (void) langid;
     size_t chr_count;
+    if (usb_xbox_mode && !usb_keyboard_only && index == 0xee) {
+        static const uint16_t ms_os[] = {0x0312,'M','S','F','T','1','0','0',0x0090};
+        return ms_os;
+    }
+    string_desc_arr[1] = usb_xbox_mode && !usb_keyboard_only ? "Microsoft" : "Sony Interactive Entertainment";
 
     if (ds_mode()) {
         string_desc_arr[2] = "DualSense Wireless Controller";
@@ -973,6 +999,7 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
     if (usb_keyboard_only) {
         string_desc_arr[2] = "DS5 Dongle Wake Keyboard";
     }
+    else if (usb_xbox_mode) string_desc_arr[2] = "Xbox Wireless Controller";
 
     switch (index) {
         case STRID_LANGID:
@@ -981,6 +1008,18 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
             break;
 
         case STRID_SERIAL: {
+            if (usb_xbox_mode && !usb_keyboard_only) {
+                uint8_t id[8]; xbox_usb_device_id(id);
+                static const char hex[] = "0123456789ABCDEF";
+                // 32 hex digits; include the same Device ID sent in GIP Hello.
+                for (unsigned i = 0; i < 16; ++i) {
+                    const uint8_t b = i < 8 ? id[7 - i] : 0;
+                    _desc_str[1 + i * 2] = hex[b >> 4];
+                    _desc_str[2 + i * 2] = hex[b & 15];
+                }
+                chr_count = 32;
+                break;
+            }
             // Present like a REAL DualSense: USB serial == controller MAC, the
             // same value the 0x09 pairing-info feature report returns. Before
             // this the serial was the Pico flash unique id, so the host saw two
@@ -1122,6 +1161,7 @@ TU_VERIFY_STATIC(sizeof(desc_ms_os_20) == MS_OS_20_DESC_LEN, "MS OS 2.0 descript
 // platform capability, then issues this vendor request to fetch the
 // descriptor set itself.
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *request) {
+    if (usb_xbox_mode && !usb_keyboard_only) return xbox_vendor_control(rhport, stage, request);
     if (!get_config().enable_wake) return false;
     if (stage != CONTROL_STAGE_SETUP) return true;
     if (request->bmRequestType_bit.type != TUSB_REQ_TYPE_VENDOR) return false;
@@ -1132,3 +1172,9 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
     return false;
 }
 #endif // ENABLE_WAKE_HID
+
+#ifndef ENABLE_WAKE_HID
+bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *request) {
+    return xbox_vendor_control(rhport, stage, request);
+}
+#endif

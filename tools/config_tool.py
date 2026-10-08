@@ -68,7 +68,7 @@ FIELDS = [
     ("disable_pico_led",   "u8",    lambda v: v in (0, 1),       "0/1"),
     ("polling_rate_mode",  "u8",    lambda v: v in (0, 1, 2),    "0:250Hz 1:500Hz 2:real-time"),
     ("audio_buffer_length","u8",    lambda v: 16 <= v <= 128,    "[16, 128]"),
-    ("controller_mode",    "u8",    lambda v: v in (0, 1, 2),    "0:DS5 1:DSE 2:Auto"),
+    ("controller_mode",    "u8",    lambda v: v in (0, 1, 2, 3), "0:DS5 1:DSE 2:Auto 3:Xbox (use OLED to switch back)"),
     ("enable_usb_sn",      "u8",    lambda v: v in (0, 1),       "0/1 (USB serial number)"),
     ("ps_shortcut_enabled","u8",    lambda v: v in (0, 1),       "0/1 (Xbox Game Bar via HID keyboard)"),
     ("mic_select",         "u8",    lambda v: v in (0, 1, 2, 3), "0:auto 1:builtin 2:headphone 3:disable"),

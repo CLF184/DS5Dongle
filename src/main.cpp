@@ -15,6 +15,7 @@
 #endif
 #include "wake.h"
 #include "usb.h"
+#include "xbox_usb.h"
 #ifdef ENABLE_WAKE_HID
 #include "ps_shortcut.h"
 #endif
@@ -102,6 +103,8 @@ critical_section_t report_cs;
 volatile bool report_dirty = false;
 
 void __not_in_flash_func(interrupt_loop)() {
+    // PS + Mute reboot shortcut disabled.
+    /*
     // OLED Edition: hold PS + Mute for 2 seconds to soft-reboot the dongle.
     // Works whether or not the OLED add-on is present. PS+Mute is uncommon
     // during gameplay and the long hold avoids accidental triggers.
@@ -118,8 +121,18 @@ void __not_in_flash_func(interrupt_loop)() {
             combo_first_us = 0;
         }
     }
+    */
 
-    if (usb_keyboard_only || usb_reconfiguring || !tud_hid_ready()) return;
+    if (usb_keyboard_only || usb_reconfiguring) return;
+    if (usb_xbox_mode) {
+        uint8_t safe_report[63];
+        critical_section_enter_blocking(&report_cs);
+        memcpy(safe_report, interrupt_in_data, sizeof(safe_report));
+        critical_section_exit(&report_cs);
+        xbox_usb_task(safe_report, sizeof(safe_report));
+        return;
+    }
+    if (!tud_hid_ready()) return;
 
     // TODO: Refactor for better code reuse
     if (get_config().polling_rate_mode != 2) {
@@ -229,7 +242,7 @@ void __not_in_flash_func(on_bt_data)(CHANNEL_TYPE channel, uint8_t *data, uint16
         // modes silently breaks wake while the host is suspended.
         wake_on_bt_input(data + 3, len - 3);
         #ifdef ENABLE_WAKE_HID
-        if (!usb_keyboard_only && !usb_reconfiguring) {
+        if (!usb_keyboard_only && !usb_reconfiguring && !usb_xbox_mode) {
             ps_shortcut_tick(data + 3, len - 3);
         }
         #endif
@@ -481,6 +494,7 @@ int main() {
 
     board_init();
     config_load();
+    usb_xbox_mode = get_config().controller_mode == 3;
 #if !ENABLE_SERIAL
     usb_keyboard_only = get_config().enable_wake;
 #endif
@@ -497,11 +511,14 @@ int main() {
 #endif
     board_init_after_tusb();
 #if ENABLE_SERIAL
-    stdio_usb_init();
-    while (!stdio_usb_connected()) {
-        tud_task();
+    // Xbox exposes only GIP, so there is no CDC interface to wait for.
+    if (!usb_xbox_mode) {
+        stdio_usb_init();
+        while (!stdio_usb_connected()) {
+            tud_task();
+        }
+        sleep_ms(150);
     }
-    sleep_ms(150);
 #endif
 
     if (cyw43_arch_init()) {
@@ -564,8 +581,9 @@ int main() {
         cyw43_arch_poll();
         bt_connection_watchdog_tick();
         tud_task();
+        xbox_usb_flush();
         wake_task();
-        audio_loop();
+        if (!usb_xbox_mode) audio_loop();
 #if ENABLE_DEBUG
         debug_log_core1_stack_usage();
 #endif
