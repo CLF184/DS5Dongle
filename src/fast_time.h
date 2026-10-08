@@ -4,29 +4,18 @@
 #include <cstdint>
 #include "hardware/timer.h"   // timer_time_us_32()：static inline，直接读 TIMER 寄存器
 
-// 主循环每秒要跑几万轮，里面那些"到点了吗"的判断不该用 time_us_64() /
-// to_ms_since_boot()：
-//   * time_us_64() 是 flash 函数调用 + 64 位读；
-//   * to_ms_since_boot() 还要再做一次 ÷1000 —— 64 位除法。开机 71.6 分钟后
-//     time_us_64() 的高 32 位不再为 0，这条路会退化成 __aeabi_uldivmod 库调用
-//     （反汇编实测：button_check / dse_task 里就是这样）。
-// 这些开销合计每轮 1~3 µs，按 23k 轮/秒算就是几个百分点的 CPU，全花在"问现在几点"。
+// 主循环的短时定时器直接保存 32 位微秒时间戳，再以无符号微秒差
+// 比较阈值：uint32_t(now_us - started_us) >= timeout_us。
+// timer_time_us_32() 是内联寄存器读，避免热路径中的 64 位读数和除法。
 //
-// 这里给两个内联读数：
-//   fast_now_us()  = 一次 TIMER 寄存器读（~5 周期）
-//   fast_now_ms()  = 同上 ÷1000，32 位常量除法被编译成一次 umull + 移位
+// 微秒计数约每 71.6 分钟按模 2^32 回绕。上述差值在实际经过的时间
+// 小于一个完整回绕周期时有效；长时计时使用 SDK 的 time_us_64()。
 //
-// 语义与 time_us_32() / to_ms_since_boot() 一致（都是开机以来的计数），所以原有的
-// "now - last >= 阈值"判断照旧写即可 —— 32 位无符号差值天然回绕安全。
-//
-// 两个注意：
-//   1. **同一模块内要统一**：时间戳必须全部来自同一套时钟，别一半 time_us_64()、
-//      一半 fast_now_ms()（两者的回绕周期不同，跨过回绕点就会算错）。
-//   2. 只在同一核内用。要跨核比较的时间戳用 64 位 time_us_64()。
-//   3. fast_now_ms() 的回绕周期是 71.6 分钟（因为底层是 32 位 µs），不是 49.7 天 ——
-//      这里的窗口都只有几百毫秒到几秒，远小于回绕周期，安全。
+// 不要先把读数除以 1000 再相减：除后的计数并非按模 2^32 回绕，
+// 毫秒无符号减法不能抵消底层的微秒回绕。需要开机以来的毫秒数时，
+// 使用 to_ms_since_boot(get_absolute_time())，从 SDK 的 64 位计数转换。
+// 同一组差值的两个时间戳必须使用相同单位；跨核共享还需正确同步。
 
 inline uint32_t fast_now_us() { return timer_time_us_32(timer_hw); }
-inline uint32_t fast_now_ms() { return fast_now_us() / 1000u; }
 
 #endif // DS5_BRIDGE_FAST_TIME_H

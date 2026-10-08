@@ -4,12 +4,11 @@
 
 #include "dse.h"
 #include "bt.h"
-#include "fast_time.h"   // 论 ms 时间戳统一用 fast_now_ms()（见该文件注释）
+#include "fast_time.h"   // 短时等待使用回绕安全的 32 位微秒差
 #include <cstdio>
 #include <cstring>
 #include <vector>
 #include <unordered_map>
-#include "pico/time.h"
 
 // Provided by bt.cpp
 extern std::unordered_map<uint8_t, std::vector<uint8_t> > feature_data;
@@ -18,7 +17,7 @@ void bt_control_send(const uint8_t *data, uint16_t len);
 
 // Unlock state: 0 = idle, 1 = waiting for the controller to process SET 0x80.
 static int unlock_phase = 0;
-static uint32_t unlock_started_ms = 0;
+static uint32_t unlock_started_us = 0;
 
 // False from connect until the unlock + prefetch completes. While false the
 // USB GET handler NAKs profile reads so the PS app retries (it polls these
@@ -27,7 +26,8 @@ static uint32_t unlock_started_ms = 0;
 static bool profiles_ready = true;
 
 // Post-save snapshot regeneration tracking.
-static uint32_t profile_written_ms = 0;
+static uint32_t profile_written_us = 0;
+static bool post_save_pending = false; // timestamp 0 is valid at timer wrap
 static int post_save_round = 0;
 
 // Paced profile prefetch sequencer. Fetching all 12 profile reports as a
@@ -35,12 +35,14 @@ static int post_save_round = 0;
 // (observed as one profile showing "not assigned"). One GET per 80ms is
 // reliable.
 static uint8_t prefetch_next = 0;       // 0 = idle, else next report id
-static uint32_t prefetch_last_ms = 0;
+static constexpr uint32_t kPrefetchGapUs = 80000u;
+static uint32_t prefetch_last_us = 0;
 static bool prefetch_mark_ready = false; // set profiles_ready when sequence ends
 
 static void prefetch_start(bool mark_ready_after) {
     prefetch_next = 0x70;
-    prefetch_last_ms = 0;
+    // Make the first GET immediately due, including near timer wrap/startup.
+    prefetch_last_us = fast_now_us() - kPrefetchGapUs;
     prefetch_mark_ready = mark_ready_after;
 }
 
@@ -73,7 +75,7 @@ void dse_on_connect() {
     unlock[1] = 0x01;
     set_feature_data(0x80, unlock, sizeof(unlock));
     // 3) Caller connects USB immediately. Gate profile reads until ready.
-    unlock_started_ms = fast_now_ms();
+    unlock_started_us = fast_now_us();
     unlock_phase = 1;
     profiles_ready = false;
 }
@@ -89,7 +91,8 @@ void dse_on_control_packet(const uint8_t *packet, uint16_t size) {
 
 void dse_on_profile_write(uint8_t reportId) {
     if (reportId >= 0x60 && reportId <= 0x62) {
-        profile_written_ms = fast_now_ms();
+        profile_written_us = fast_now_us();
+        post_save_pending = true;
         post_save_round = 0;
     }
 }
@@ -97,15 +100,15 @@ void dse_on_profile_write(uint8_t reportId) {
 void dse_task() {
     // 常见情况（普通 DS5、没有写盘、没有待解锁）三件事都不用做 —— 先判状态，
     // 连"现在几点"都不问：原来这里每轮无条件做一次 to_ms_since_boot(64 位读 + ÷1000)。
-    if (prefetch_next == 0 && profile_written_ms == 0 && unlock_phase == 0) return;
+    if (prefetch_next == 0 && !post_save_pending && unlock_phase == 0) return;
 
-    const uint32_t now = fast_now_ms();
+    const uint32_t now = fast_now_us();
     const uint16_t cid = bt_control_cid();
 
     // Paced prefetch sequencer: one profile GET per 80ms.
     if (prefetch_next != 0 && cid != 0) {
-        if (now - prefetch_last_ms >= 80) {
-            prefetch_last_ms = now;
+        if (now - prefetch_last_us >= kPrefetchGapUs) {
+            prefetch_last_us = now;
             get_feature_data(prefetch_next, 64);
             if (prefetch_next == 0x7B) {
                 prefetch_next = 0;
@@ -127,9 +130,9 @@ void dse_task() {
     //   SET 0x80  ->  poll GET 0x81 (x6, spaced)  ->  re-read profiles.
     // A profile write updates controller storage but not the read-back
     // snapshot; without this the save is only visible after the next app open.
-    if (profile_written_ms != 0 && cid != 0) {
-        const uint32_t since_write = now - profile_written_ms;
-        if (post_save_round == 0 && since_write >= 500) {
+    if (post_save_pending && cid != 0) {
+        const uint32_t since_write = now - profile_written_us;
+        if (post_save_round == 0 && since_write >= 500000u) {
             uint8_t unlock[59]{};
             unlock[0] = 0x70;
             unlock[1] = 0x01;
@@ -137,13 +140,13 @@ void dse_task() {
             post_save_round = 1;
             printf("[DSE] Post-save: re-sent 0x80\n");
         } else if (post_save_round >= 1 && post_save_round <= 6 &&
-                   since_write >= 1000 + 250u * (post_save_round - 1)) {
+                   since_write >= 1000000u + 250000u * (post_save_round - 1)) {
             get_feature_data(0x81, 64); // status poll, mirrors app behavior
             post_save_round++;
-        } else if (post_save_round == 7 && since_write >= 5500) {
+        } else if (post_save_round == 7 && since_write >= 5500000u) {
             prefetch_start(false); // paced refetch of 0x70-0x7B
             post_save_round = 8;
-            profile_written_ms = 0;
+            post_save_pending = false;
             printf("[DSE] Post-save: profile snapshot refetch started\n");
         }
     }
@@ -159,7 +162,7 @@ void dse_task() {
         profiles_ready = true; // don't leave profiles gated if it vanished
         return;
     }
-    if (unlock_phase == 1 && now - unlock_started_ms >= 4000) {
+    if (unlock_phase == 1 && now - unlock_started_us >= 4000000u) {
         prefetch_start(true);
         unlock_phase = 0;
         printf("[DSE] Unlock wait done, prefetching profile reports\n");

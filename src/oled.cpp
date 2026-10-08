@@ -1223,7 +1223,7 @@ __attribute__((noinline))
 void format_diag_row(int idx, char* line, size_t n) {
     switch (idx) {
         case 0: {
-            const uint32_t s = time_us_32() / 1000000u;
+            const uint32_t s = (uint32_t)(time_us_64() / 1000000u);
             snprintf(line, n, "Up:%luh %02lum %02lus",
                      (unsigned long)(s / 3600u),
                      (unsigned long)((s / 60u) % 60u),
@@ -1816,7 +1816,7 @@ void lightbar_compute_mode(int mode, uint32_t now_ms) {
 __attribute__((noinline))
 void lightbar_update_color() {
     if (!bt_is_connected()) { g_lightbar_override = false; return; }
-    const uint32_t now_ms = time_us_32() / 1000;
+    const uint32_t now_ms = to_ms_since_boot(get_absolute_time());
 
     if (g_charge_eta.charging) {
         // ~4.6 s breathing cycle (256 phase steps × 18 ms). Base amber

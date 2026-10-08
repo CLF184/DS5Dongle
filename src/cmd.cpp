@@ -151,7 +151,7 @@ uint16_t pico_cmd_get(uint8_t report_id, uint8_t *buffer, uint16_t reqlen) {
             printf("[HID] 0xfb reqlen=%u too small for diag payload (%u)\n", reqlen, want);
             return 0;
         }
-        const uint32_t uptime_s   = time_us_32() / 1000000u;
+        const uint32_t uptime_s   = (uint32_t)(time_us_64() / 1000000u);
         const uint32_t usb_frames = audio_usb_frames();
         const uint32_t bt_packets = audio_bt_packets();
         const uint32_t hci_errs   = bt_hci_err_count();
