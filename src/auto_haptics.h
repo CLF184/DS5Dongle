@@ -56,7 +56,9 @@ struct AutoHaptics {
         mode = cfg.auto_haptics_enable;
         static const float LP_COEFF[4] = { 0.01039f, 0.02074f, 0.03095f, 0.05123f };
         lp_a = LP_COEFF[cfg.auto_haptics_lowpass & 3];
-        gain = (mode > 0) ? (cfg.auto_haptics_gain / 100.0f) * cfg.haptics_gain : 0.0f;
+        // AH Gain controls the generated waveform; audio.cpp applies the
+        // global haptics_gain once after resampling to the combined output.
+        gain = (mode > 0) ? (cfg.auto_haptics_gain / 100.0f) : 0.0f;
         fallback_active = (mode == 1) && (native_silent_count >= NATIVE_SILENT_TIMEOUT);
         peak = 0.0f; // per-frame reset（原来是循环里的局部变量）
     }
