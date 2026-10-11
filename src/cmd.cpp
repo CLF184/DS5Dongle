@@ -70,8 +70,14 @@ extern volatile uint32_t g_host_out02_total;
 extern volatile uint32_t g_host_out02_trig_allow;
 extern volatile uint32_t g_host_out02_to_bt;
 
+// Read-only audio / flash diagnostics, same 15-word layout as upstream 0xF5.
+extern volatile uint32_t g_fse_calls, g_fse_fail, g_setfeat_count, g_setfeat_last;
+static uint32_t host_config_gen = 0;
+uint32_t cmd_host_config_gen() { return host_config_gen; }
+
 bool is_pico_cmd(uint8_t report_id) {
-    if (report_id == 0xf6 ||
+    if (report_id == 0xf5 ||
+        report_id == 0xf6 ||
         report_id == 0xf7 ||
         report_id == 0xf8 ||
         report_id == 0xf9 ||
@@ -87,7 +93,18 @@ bool is_pico_cmd(uint8_t report_id) {
 }
 
 uint16_t pico_cmd_get(uint8_t report_id, uint8_t *buffer, uint16_t reqlen) {
-        if (report_id == 0xf7) {
+    if (report_id == 0xf5) {
+        const uint32_t words[] = {
+            audio_usb_frames(), audio_bt_packets(), audio_fifo_drops(),
+            opus_fifo_drops(), audio_hap_drops(), audio_c1_loops(), audio_c1_enc(),
+            audio_raw_push(), audio_hap_push(), audio_mic_frames(), audio_mic_plc_frames(),
+            g_fse_calls, g_fse_fail, g_setfeat_count, g_setfeat_last,
+        };
+        const uint16_t len = std::min<size_t>(reqlen, sizeof(words));
+        memcpy(buffer, words, len);
+        return len;
+    }
+    if (report_id == 0xf7) {
         printf("[HID] Receive 0xf7 getting config\n");
         if (sizeof(Config_body) > reqlen) {
             printf("[Config] Warning: Config_body overflow\n");
@@ -261,8 +278,8 @@ uint16_t pico_cmd_get(uint8_t report_id, uint8_t *buffer, uint16_t reqlen) {
 }
 
 void pico_cmd_set(uint8_t report_id, uint8_t const *buffer, uint16_t bufsize) {
-    (void) report_id;
-    if (bufsize == 0) {
+    // Other feature IDs are read-only; only F6 may execute commands.
+    if (report_id != 0xf6 || bufsize == 0) {
         return;
     }
 
@@ -273,7 +290,11 @@ void pico_cmd_set(uint8_t report_id, uint8_t const *buffer, uint16_t bufsize) {
 #if ENABLE_VERBOSE
         printf("[CMD] Enter config set func\n");
 #endif
+        if (bufsize < 2) return;
+        const uint8_t active_slot = static_cast<uint8_t>(bt_get_slot());
         set_config(buffer + 1, bufsize - 1);
+        get_config().current_slot = active_slot;
+        ++host_config_gen;
     }
     if (buffer[0] == 0x02) {
         printf("[CMD] Enter config save func\n");

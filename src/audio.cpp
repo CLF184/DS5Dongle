@@ -48,7 +48,8 @@ static WDL_Resampler resampler;
 extern uint8_t reportSeqCounter;
 extern uint8_t packetCounter;
 static bool plug_headset = false;
-static bool mic_active = false; // host has opened the mic IN interface (alt != 0)
+static volatile uint32_t mic_epoch = 0; // close/reopen/disconnect flush generation
+static volatile bool mic_active = false; // host has opened the mic IN interface (alt != 0)
 alignas(8) static uint32_t audio_core1_stack[7000];
 queue_t audio_fifo; // raw pcm data
 queue_t mic_fifo;
@@ -62,11 +63,12 @@ struct audio_raw_element {
 
 struct mic_element {
     uint8_t data[MIC_OPUS_SIZE];
+    uint32_t epoch;
 };
 
 struct mic_decode_element {
     int16_t data[MIC_FRAMES * MIC_CHANNELS];
-    uint16_t len;
+    uint32_t epoch;
 };
 
 struct audio_spk_element {
@@ -90,6 +92,33 @@ uint16_t audio_mic_last_want()    { return g_mic_last_want; }
 uint16_t audio_mic_last_wrote()   { return g_mic_last_wrote; }
 static volatile uint32_t g_mic_decode_failures = 0;  // opus_decode returns <= 0 (bad/missing packets)
 uint32_t audio_mic_decode_failures() { return g_mic_decode_failures; }
+
+static constexpr int      MIC_DECODE_DEPTH  = 8;       // jitter-buffer capacity (frames)
+static constexpr int      MIC_PLAYOUT_START = 3;       // pre-buffer before playout begins
+static constexpr uint32_t MIC_FRAME_US      = 10000;  // 10 ms per Opus frame @ 48 kHz
+static constexpr uint32_t MIC_SESSION_US    = 300000; // no real frame this long → session over
+// 1 ms of 48 kHz stereo int16 = 48 frames = 192 bytes. The mic IN FIFO is only
+// 4 USB packets deep (~784 B), so the old whole-frame 1920 B write was always
+// truncated by TinyUSB; feeding 1 ms slices as space frees up slaves the mic to
+// the host clock (upstream 370032e, written for macOS CoreAudio).
+static constexpr uint32_t MIC_SLICE_FRAMES  = 48;
+static constexpr uint32_t MIC_SLICE_BYTES   = MIC_SLICE_FRAMES * 2 * sizeof(int16_t);
+static volatile uint32_t g_mic_last_real_us = 0;      // core1 writes, core0 reads (32-bit: no tearing)
+static volatile bool     g_mic_session      = false;  // real frames arrived within MIC_SESSION_US
+static volatile uint32_t g_mic_plc_frames = 0;        // concealed frames generated (Diag)
+uint32_t audio_mic_plc_frames() { return g_mic_plc_frames; }
+
+
+static volatile uint32_t g_drop_raw = 0, g_drop_enc = 0, g_drop_hap = 0;
+static volatile uint32_t g_c1_loops = 0, g_c1_enc = 0, g_raw_push = 0, g_hap_push = 0;
+uint32_t audio_fifo_drops() { return g_drop_raw; }
+uint32_t opus_fifo_drops() { return g_drop_enc; }
+uint32_t audio_hap_drops() { return g_drop_hap; }
+uint32_t audio_c1_loops() { return g_c1_loops; }
+uint32_t audio_c1_enc() { return g_c1_enc; }
+uint32_t audio_raw_push() { return g_raw_push; }
+uint32_t audio_hap_push() { return g_hap_push; }
+
 
 // Monotonic byte-flow counters for the OLED Diagnostics screen and the web
 // emulator's USB / BT rate display. Updated below.
@@ -137,8 +166,14 @@ void set_headset(bool state) {
 // Called from tud_audio_set_itf_cb when the host opens/closes the mic IN
 // interface. Gates controller-mic streaming so it only runs while recording.
 void set_mic_active(bool active) {
+    if (mic_active != active) ++mic_epoch;
     mic_active = active;
     update_mic_status();
+}
+
+void audio_on_bt_disconnected() {
+    // Keep the host's open interface state, but discard the previous controller's audio.
+    ++mic_epoch;
 }
 
 bool audio_mic_active() {
@@ -251,101 +286,59 @@ void __not_in_flash_func(audio_bt_task)() {
     g_bt_packets++;
 }
 
+// Mic out: feed decoded PCM to the USB IN FIFO in 1 ms slices whenever it has
+// room, so delivery follows the host's clock instead of our own timer. Pre-
+// buffers MIC_PLAYOUT_START frames per session to absorb BT jitter; on underrun
+// writes a silent slice so the host stream never starves (CoreAudio resets on
+// starvation). Silence also covers BT Mic off while the host has the mic open.
+static void __not_in_flash_func(mic_drain)() {
+    static bool started = false;
+    static bool have = false;
+    static uint32_t offset = 0;
+    static mic_decode_element frame{};
+
+    static uint32_t seen_epoch = 0;
+    const uint32_t epoch = mic_epoch;
+    if (seen_epoch != epoch) { started = false; have = false; seen_epoch = epoch; }
+    if (!mic_active || get_config().mic_select == 3) { started = false; have = false; return; }
+    tu_fifo_t *ff = tud_audio_get_ep_in_ff();
+    if (ff == nullptr) return;
+
+    if (!started && queue_get_level(&mic_decode_fifo) >= MIC_PLAYOUT_START) started = true;
+    if (started && !g_mic_session && queue_is_empty(&mic_decode_fifo) && !have) {
+        started = false; // session over — re-buffer when the mic comes back
+    }
+
+    while (tu_fifo_remaining(ff) >= MIC_SLICE_BYTES) {
+        static int16_t slice[MIC_SLICE_FRAMES * 2];
+        if (!have) {
+            if (started && queue_try_remove(&mic_decode_fifo, &frame) && frame.epoch == epoch) {
+                have = true;
+                offset = 0;
+            } else {
+                memset(slice, 0, sizeof(slice));
+                tud_audio_write(slice, MIC_SLICE_BYTES);
+                break;
+            }
+        }
+        for (uint32_t i = 0; i < MIC_SLICE_FRAMES; i++) {
+            const int16_t s = frame.data[offset + i];
+            slice[i * 2]     = s; // mono duplicated to L/R — our UAC1 mic is 2-ch like a real DS5
+            slice[i * 2 + 1] = s;
+        }
+        g_mic_last_wrote = tud_audio_write(slice, MIC_SLICE_BYTES);
+        g_mic_last_want  = MIC_SLICE_BYTES;
+        offset += MIC_SLICE_FRAMES;
+        if (offset >= MIC_FRAMES) have = false;
+    }
+}
+
+
 void __not_in_flash_func(audio_loop)() {
     const Config_body &cfg = get_config();
-    const bool mic_enabled = mic_active && cfg.mic_select != 3;
     const bool speaker_enabled = cfg.speaker_select != 3;
 
-    /* 
-    // Mic playback: drain decoded mic PCM into the USB IN endpoint
-    static mic_decode_element mic_pb{};
-    if (queue_try_remove(&mic_decode_fifo, &mic_pb)) {
-        if (mic_enabled) {
-            // The controller mic is mono, but the USB descriptor presents a 2-channel
-            // mic (matching the real DS5) so Windows doesn't conflict with its cached
-            // DS5 audio format. Pack each mono int16 sample as L/R in one 32-bit word.
-            static uint32_t mic_stereo[MIC_FRAMES];
-            const int mono_samples = mic_pb.len / 2;
-            for (int i = 0; i < mono_samples; i++) {
-                const uint16_t sample = static_cast<uint16_t>(mic_pb.data[i]);
-                mic_stereo[i] = static_cast<uint32_t>(sample) | (static_cast<uint32_t>(sample) << 16);
-            }
-            const uint16_t stereo_len = (uint16_t) (mono_samples * sizeof(uint32_t));
-            uint16_t written = tud_audio_write(mic_stereo, stereo_len);
-            if (written != stereo_len) {
-                // Gated behind ENABLE_VERBOSE: when the host has not opened the mic
-                // interface (the common case -- most games never do) tud_audio_write
-                // short-writes every frame, so an unconditional log would flood
-                // core0's hot path with the newlib formatting chain.
-#if ENABLE_VERBOSE
-                printf("[Audio] Warning: USB mic FIFO wrote %u/%u bytes\n", written, stereo_len);
-#endif
-            }
-        }
-    */
-
-    // --- BUGFIX: HARDWARE-THROTTLED DIRECT SLICE DRAINING ---
-    // Slaves the microphone transmission speed to the USB host clock.
-    // Instead of pushing entire decoded frames at once (which causes buffer
-    // overflows and digital echo on strict OS stacks like macOS CoreAudio), 
-    // we query TinyUSB's transmit FIFO capacity and feed it 1ms slices (192 bytes)
-    // precisely when the host is ready to consume them.
-
-    // Streaming state for hardware-throttled USB microphone transmission
-    static mic_decode_element active_mic_frame{};
-    static uint32_t active_frame_offset = 0;
-    static bool has_active_frame = false;
-
-    if (mic_enabled) {
-        tu_fifo_t* tx_fifo = tud_audio_get_ep_in_ff();
-        
-        while (tx_fifo && tu_fifo_remaining(tx_fifo) >= 192) {
-            if (!has_active_frame) {
-                if (queue_try_remove(&mic_decode_fifo, &active_mic_frame)) {
-                    has_active_frame = true;
-                    active_frame_offset = 0;
-                } else {
-                    // Buffer Underrun Safety: If the decode queue runs dry, we MUST
-                    // feed the USB interface with silence to keep the stream alive.
-                    // This prevents macOS CoreAudio from resetting the driver.
-                    int16_t silence[96] = {0};
-                    tud_audio_write(silence, sizeof(silence));
-                    break; 
-                }
-            }
-
-            if (has_active_frame) {
-                int16_t usb_tx_buf[96]; // 48 Stereo-Frames (192 Bytes)
-                const int16_t* src = active_mic_frame.data;
-                const uint32_t total_samples = active_mic_frame.len / sizeof(int16_t);
-                const uint32_t samples_needed = 48;
-
-                for (uint32_t i = 0; i < samples_needed; i++) {
-                    uint32_t src_idx = active_frame_offset + i;
-                    if (src_idx < total_samples) {
-                        int16_t sample = src[src_idx];
-                        usb_tx_buf[i * 2] = sample;     // Duplicate mono to Left
-                        usb_tx_buf[i * 2 + 1] = sample; // Duplicate mono to Right
-                    } else {
-                        usb_tx_buf[i * 2] = 0;
-                        usb_tx_buf[i * 2 + 1] = 0;
-                    }
-                }
-
-                const uint16_t wrote = tud_audio_write(usb_tx_buf, sizeof(usb_tx_buf));
-                g_mic_last_want  = (uint16_t) sizeof(usb_tx_buf);
-                g_mic_last_wrote = wrote;
-                active_frame_offset += samples_needed;
-
-                if (active_frame_offset >= total_samples) {
-                    has_active_frame = false; // Current frame completely drained
-                    g_mic_frames++;
-                }
-            }
-        }
-    } else {
-        has_active_frame = false;
-    }
+    mic_drain();
 
     audio_bt_task();
 
@@ -418,14 +411,16 @@ void __not_in_flash_func(audio_loop)() {
 
 #if !DISABLE_SPEAKER_PROC
         if (speaker_enabled) {
-            audio_buf[audio_buf_pos++] = raw[i * INPUT_CHANNELS] / 32768.0f * audio_gain;
-            audio_buf[audio_buf_pos++] = raw[i * INPUT_CHANNELS + 1] / 32768.0f * audio_gain;
+            audio_buf[audio_buf_pos++] = clamp(raw[i * INPUT_CHANNELS] / 32768.0f * audio_gain, -1.0f, 1.0f);
+            audio_buf[audio_buf_pos++] = clamp(raw[i * INPUT_CHANNELS + 1] / 32768.0f * audio_gain, -1.0f, 1.0f);
             if (audio_buf_pos == 512 * 2) {
                 static audio_raw_element element{};
                 memcpy(element.data, audio_buf, 512 * 2 * 4);
                 if (queue_is_full(&audio_fifo)) {
                     queue_try_remove(&audio_fifo, NULL);
+                    g_drop_raw++;
                 }
+                g_raw_push++;
                 if (!queue_try_add(&audio_fifo, &element)) {
                     printf("[Audio] Warning: audio_fifo add failed\n");
                 }
@@ -470,7 +465,9 @@ void __not_in_flash_func(audio_loop)() {
         memcpy(element.data, haptic_buf,SAMPLE_SIZE);
         if (queue_is_full(&haptics_fifo)) {
             queue_try_remove(&haptics_fifo, NULL);
+            g_drop_hap++;
         }
+        g_hap_push++;
         if (!queue_try_add(&haptics_fifo, &element)) {
             printf("[Audio] Warning: haptics_fifo add failed\n");
         }
@@ -503,21 +500,22 @@ void audio_init() {
     // queue_init(&mic_fifo, sizeof(mic_element), 2);
     // queue_init(&mic_decode_fifo, sizeof(mic_decode_element), 2);
     queue_init(&mic_fifo, sizeof(mic_element), 8);
-    queue_init(&mic_decode_fifo, sizeof(mic_decode_element), 8);
+    queue_init(&mic_decode_fifo, sizeof(mic_decode_element), MIC_DECODE_DEPTH);
 #if !DISABLE_SPEAKER_PROC
     queue_init(&audio_fifo, sizeof(audio_raw_element), 2);
     queue_init(&audio_spk_fifo, sizeof(audio_spk_element), 2);
+#endif
 #if ENABLE_DEBUG
     // 通常 stack 最大使用 25836 bytes 即 stack[6459]
     debug_fill_core1_stack_watermark(audio_core1_stack,
                                      sizeof(audio_core1_stack) / sizeof(audio_core1_stack[0]));
 #endif
+    // The microphone decoder needs core1 even when speaker encoding is disabled.
     multicore_launch_core1_with_stack(core1_entry, audio_core1_stack, sizeof(audio_core1_stack));
-#endif
 }
 
+#if !DISABLE_SPEAKER_PROC
 static OpusEncoder *encoder;
-static OpusDecoder *decoder; // mic decoder
 static WDL_Resampler resampler_audio;
 
 // Speaker path: USB OUT PCM (core0 audio_fifo) -> resample -> opus encode ->
@@ -550,46 +548,86 @@ static void __not_in_flash_func(speaker_proc)() {
     }
 
     static audio_spk_element spk_ele{};
+    g_c1_enc++;
     memcpy(spk_ele.data, out, encoded_len);
     if (encoded_len < (int) sizeof(spk_ele.data)) {
         memset(spk_ele.data + encoded_len, 0, sizeof(spk_ele.data) - encoded_len);
     }
     if (queue_is_full(&audio_spk_fifo)) {
         queue_try_remove(&audio_spk_fifo, NULL);
+        g_drop_enc++;
     }
     if (!queue_try_add(&audio_spk_fifo, &spk_ele)) {
         printf("[Audio] Warning: audio_spk_fifo add failed\n");
     }
 }
 
-// Mic path: opus packets from the controller (core0 mic_fifo) -> opus decode ->
-// PCM into mic_decode_fifo for audio_loop to push to the USB IN endpoint.
-static void __not_in_flash_func(mic_proc)() {
-    static mic_element mic_packet{};
-    if (!queue_try_remove(&mic_fifo, &mic_packet)) {
-        return;
+#endif // !DISABLE_SPEAKER_PROC
+
+static void __not_in_flash_func(mic_push_decoded)(const mic_decode_element &dec) {
+    if (queue_is_full(&mic_decode_fifo)) queue_try_remove(&mic_decode_fifo, NULL);
+    queue_try_add(&mic_decode_fifo, &dec);
+}
+
+// Mic path: Opus from the controller (mic_fifo) -> decode -> jitter buffer.
+// If real packets stop mid-session, conceal one frame per missed 10 ms slot
+// via Opus PLC; after MIC_SESSION_US of silence the session is over.
+static bool __not_in_flash_func(mic_proc)() {
+    static mic_element pkt{};
+    static mic_decode_element dec{};
+    static uint32_t last_out_us = 0;
+    static uint32_t seen_epoch = 0;
+    const uint32_t epoch = mic_epoch;
+    if (seen_epoch != epoch) {
+        opus_decoder_ctl(mic_decoder, OPUS_RESET_STATE);
+        seen_epoch = epoch;
+        g_mic_session = false;
+        while (queue_try_remove(&mic_decode_fifo, nullptr)) {}
     }
-    if (!mic_active || get_config().mic_select == 3) {
-        return;
+    if (!mic_active || get_config().mic_select == 3 || !bt_is_connected()) {
+        g_mic_session = false;
+        while (queue_try_remove(&mic_fifo, nullptr)) {}
+        while (queue_try_remove(&mic_decode_fifo, nullptr)) {}
+        return false;
     }
-    static mic_decode_element decode_element{};
-    auto decoded_samples = opus_decode(decoder, mic_packet.data, MIC_OPUS_SIZE, decode_element.data, MIC_FRAMES, false);
-    g_mic_last_decoded = decoded_samples;
-    if (decoded_samples <= 0) {
-        g_mic_decode_failures++;
-        // Gated behind ENABLE_VERBOSE: printf pulls the newlib formatting chain
-        // (flash) onto core1's path. Release builds compile it out so core1's
-        // audio loop stays fully RAM-resident (no XIP fetches on this core).
-#if ENABLE_VERBOSE
-        printf("[Audio] OpusDecoder decode failed: %d\n", decoded_samples);
-#endif
-        return;
+    const uint32_t now = time_us_32();
+
+    if (queue_try_remove(&mic_fifo, &pkt)) {
+        if (pkt.epoch != epoch) return true;
+        const int n = opus_decode(mic_decoder, pkt.data, MIC_OPUS_SIZE, dec.data, MIC_FRAMES, 0);
+        g_mic_last_decoded = n; // observed in OLED Diag
+        if (n > 0) {
+            if (n < MIC_FRAMES) memset(dec.data + n, 0, (MIC_FRAMES - n) * sizeof(int16_t));
+            dec.epoch = epoch;
+            mic_push_decoded(dec);
+            g_mic_last_real_us = now;
+            g_mic_session = true;
+            g_mic_frames++;
+            last_out_us = now;
+        } else {
+            g_mic_decode_failures++;
+        }
+        return true;
     }
-    decode_element.len = decoded_samples * MIC_CHANNELS * sizeof(int16_t);
-    if (queue_is_full(&mic_decode_fifo)) {
-        queue_try_remove(&mic_decode_fifo, NULL);
+    if (!g_mic_session) return false;
+    if (now - g_mic_last_real_us >= MIC_SESSION_US) {
+        g_mic_session = false;
+        return false;
     }
-    queue_try_add(&mic_decode_fifo, &decode_element);
+    // Half a frame of slack before concealing, so normal BT jitter isn't
+    // mistaken for loss.
+    if (now - last_out_us >= MIC_FRAME_US + MIC_FRAME_US / 2) {
+        const int n = opus_decode(mic_decoder, nullptr, 0, dec.data, MIC_FRAMES, 0); // PLC
+        if (n > 0) {
+            if (n < MIC_FRAMES) memset(dec.data + n, 0, (MIC_FRAMES - n) * sizeof(int16_t));
+            dec.epoch = epoch;
+            mic_push_decoded(dec);
+            g_mic_plc_frames++;
+        }
+        last_out_us += MIC_FRAME_US;
+        return true;
+    }
+    return false;
 }
 
 void __not_in_flash_func(core1_entry)() {
@@ -606,6 +644,7 @@ void __not_in_flash_func(core1_entry)() {
     sleep_ms(300);
 
     int error = 0;
+#if !DISABLE_SPEAKER_PROC
     encoder = opus_encoder_create(48000, 2,OPUS_APPLICATION_AUDIO, &error);
     if (error != 0) {
         printf("[Audio] OpusEncoder create failed\n");
@@ -619,9 +658,11 @@ void __not_in_flash_func(core1_entry)() {
     resampler_audio.SetRates(51200, 48000);
     resampler_audio.SetFeedMode(true);
     resampler_audio.Prealloc(2, 512, 480);
-    decoder = opus_decoder_create(48000, MIC_CHANNELS, &error);
+#endif
+    mic_decoder = opus_decoder_create(48000, MIC_CHANNELS, &error);
     if (error != 0) {
         printf("[Audio] OpusDecoder create failed\n");
+        mic_decoder = nullptr;
     }
 
     static LoopProbe probe_core1;
@@ -631,20 +672,20 @@ void __not_in_flash_func(core1_entry)() {
         // 有音频时一轮 = 一次 opus 编/解码，被 core0 的 flash 擦写停车则会出现
         // 几十 ms 的尖峰 —— 这些都会体现在 Diag 屏的 Loop1 行。见 loop_probe.h。
         loop_probe_tick(probe_core1, 1);
+        g_c1_loops++;
 
         bool work_done = false;
 
         // Only enter processing if data is actually waiting.
         // This avoids constantly acquiring queue locks (spinlocks) when idle,
         // which would otherwise thrash the RP2350 system bus and starve Core 0.
-        if (queue_get_level(&audio_fifo) > 0) {
+#if !DISABLE_SPEAKER_PROC
+        if (encoder != nullptr && queue_get_level(&audio_fifo) > 0) {
             speaker_proc();
             work_done = true;
         }
-        if (queue_get_level(&mic_fifo) > 0) {
-            mic_proc();
-            work_done = true;
-        }
+#endif
+        if (mic_decoder != nullptr && mic_proc()) work_done = true;
         
         // If both queues are empty, we can safely sleep.
         // This prevents 100% CPU usage while maintaining sub-millisecond response times.
@@ -661,6 +702,7 @@ void __not_in_flash_func(mic_add_queue)(uint8_t *data, uint16_t len) {
     if (!mic_active || get_config().mic_select == 3) return;
     if (len < MIC_OPUS_SIZE) return;
     static mic_element mic_packet{};
+    mic_packet.epoch = mic_epoch;
     memcpy(mic_packet.data, data, MIC_OPUS_SIZE);
     if (queue_is_full(&mic_fifo)) {
         queue_try_remove(&mic_fifo, NULL);

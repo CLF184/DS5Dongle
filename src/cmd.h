@@ -18,4 +18,7 @@ uint16_t pico_cmd_get(uint8_t report_id, uint8_t *buffer, uint16_t reqlen);
 // the 0xfc web telemetry both call this so device and web always agree.
 uint16_t cpu_temp_raw_smoothed();
 
+// Incremented only when the host applies a configuration (OLED cache invalidation).
+uint32_t cmd_host_config_gen();
+
 #endif //DS5_BRIDGE_CMD_H

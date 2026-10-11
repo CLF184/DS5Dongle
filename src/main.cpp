@@ -39,6 +39,9 @@
 
 // Pico SDK speciifically for waiting on conditions
 #include "pico/critical_section.h"
+#include "pico/flash.h"
+#include "pico/multicore.h"
+#include "hardware/sync.h"
 
 // 主循环抖动探针的共享槽位：各核只写自己那一格，见 loop_probe.h。
 volatile uint32_t g_loop_max_us[2] = {0, 0};
@@ -374,6 +377,27 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
 
 // Invoked when received SET_REPORT control request or
 // received data on OUT endpoint ( Report ID = 0, Type = 0 )
+volatile uint32_t g_fse_calls = 0, g_fse_fail = 0;
+volatile uint32_t g_setfeat_count = 0, g_setfeat_last = 0;
+
+extern "C" int __real_flash_safe_execute(void (*func)(void *), void *param, uint32_t enter_exit_timeout_ms);
+extern "C" int __wrap_flash_safe_execute(void (*func)(void *), void *param, uint32_t enter_exit_timeout_ms) {
+    g_fse_calls++;
+    // Before core1 registers for lockout (boot: BTstack TLV init, *_load
+    // repairs) the SDK refuses with PICO_ERROR_NOT_PERMITTED and the write is
+    // silently lost. Core1 isn't running audio yet, so masking core0's IRQs is
+    // enough.
+    if (!multicore_lockout_victim_is_initialized(1)) {
+        const uint32_t irq = save_and_disable_interrupts();
+        func(param);
+        restore_interrupts(irq);
+        return PICO_OK;
+    }
+    const int rc = __real_flash_safe_execute(func, param, enter_exit_timeout_ms);
+    if (rc != PICO_OK) g_fse_fail++;
+    return rc;
+}
+
 void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer,
                            uint16_t bufsize) {
 #ifdef ENABLE_WAKE_HID
@@ -388,6 +412,13 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
     (void) buffer;
     (void) bufsize;
 
+    if (report_id != 0) {
+        g_setfeat_count++;
+        g_setfeat_last = report_id | (bufsize ? buffer[0] : 0) << 8 | (uint32_t)bufsize << 16;
+    }
+    // Empty OUT transfers carry no report ID or state. Ignore them before dereferencing.
+    if (bufsize == 0) return;
+
     if (is_pico_cmd(report_id)) {
 #if ENABLE_VERBOSE
         printf("[HID] Receive 0xf6 setting config, funcid:0x%02X\n", buffer[0]);
@@ -400,6 +431,7 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
     if (report_id == 0) {
         switch (buffer[0]) {
             case 0x02: {
+                if (bufsize < 1 + sizeof(SetStateData)) return;
                 g_host_out02_total++;
                 // valid_flag0 lives at buffer[1] (right after the 0x02 report id).
                 // Bits 2 & 3 are AllowRight/LeftTriggerFFB.
@@ -462,6 +494,7 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
                     state.LedBlue = 0;
                 }
 
+                bt_note_state(state);
                 memcpy(outputData + 3, &state, sizeof(SetStateData));
                 bt_write(outputData, sizeof(outputData));
 #if ENABLE_VERBOSE
@@ -582,6 +615,7 @@ int main() {
         bt_connection_watchdog_tick();
         tud_task();
         xbox_usb_flush();
+        bt_initial_state_task();
         wake_task();
         if (!usb_xbox_mode) audio_loop();
 #if ENABLE_DEBUG

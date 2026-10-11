@@ -22,6 +22,7 @@
 #include "pico/time.h"
 
 extern uint8_t interrupt_in_data[63]; // defined in main.cpp
+extern volatile uint32_t g_fse_calls, g_fse_fail;
 
 // Mic diagnostic counters (defined in main.cpp).
 extern uint32_t bt_31_packet_count();
@@ -160,6 +161,7 @@ enum : uint8_t {
     SIF_WRAP    = 1u << 0, // lo..hi 环绕（枚举项）；否则 clamp
     SIF_SNAP    = 1u << 1, // 档位吸附：0 或 >=10（Inact 空闲超时）
     SIF_FLOAT10 = 1u << 2, // 字段是 float，按 ×10 处理（Hap Gain；packed 偏移不对齐，走 memcpy）
+    SIF_GRID    = 1u << 4, // snap to step grid, including the +12 dB endpoint
     SIF_PIN     = 1u << 3, // status_gpio：0xFF=off 且调值时跳过不可选脚
 };
 
@@ -186,8 +188,8 @@ static const char* const kStatMode[] = {"Level", "Pulse"};
 
 #define CFG_OFF(field) ((uint8_t)offsetof(Config_body, field))
 static const SetItem kSetItems[] = {
-    {"Hap Gain", nullptr, nullptr, nullptr,    SK_NUM,  SF_PLAIN, SIF_FLOAT10, ACT_NONE, CFG_OFF(haptics_gain),           0, 10, 20, 1},
-    {"Spk Vol",  "dB",    nullptr, nullptr,    SK_NUM,  SF_PLAIN, 0,           ACT_NONE, CFG_OFF(speaker_volume),        -100, 0, 100, 5},
+    {"Hap Gain", nullptr, nullptr, nullptr,    SK_NUM,  SF_PLAIN, SIF_FLOAT10, ACT_NONE, CFG_OFF(haptics_gain),           0, 10, 60, 5},
+    {"Spk Vol",  "dB",    nullptr, nullptr,    SK_NUM,  SF_PLAIN, SIF_GRID,    ACT_NONE, CFG_OFF(speaker_volume),        -100, 0, 112, 5},
     {"Inact",    "min",   nullptr, nullptr,    SK_NUM,  SF_OFF0,  SIF_SNAP,    ACT_NONE, CFG_OFF(inactive_time),         0, 0, 60, 5},
     {"Pico LED", nullptr, nullptr, kPicoLed,   SK_BOOL, SF_PLAIN, 0,           ACT_NONE, CFG_OFF(disable_pico_led),      0, 0, 1, 1},
     {"Poll",     nullptr, nullptr, kPoll,      SK_NUM,  SF_PLAIN, SIF_WRAP,    ACT_NONE, CFG_OFF(polling_rate_mode),     0, 0, 2, 1},
@@ -1218,7 +1220,7 @@ void sample_diag_rates() {
 // Row list ordered by relevance: always-useful at top, parked-mic-investigation
 // data at bottom. To add a row, bump kNumDiagRows and add a case.
 //   0 Up   1 BT   2/3 Loop0/Loop1   4 host02   5 trig   6-9 速率  10-12 麦克风
-constexpr int kNumDiagRows = 13;
+constexpr int kNumDiagRows = 18;
 __attribute__((noinline))
 void format_diag_row(int idx, char* line, size_t n) {
     switch (idx) {
@@ -1288,6 +1290,23 @@ void format_diag_row(int idx, char* line, size_t n) {
             const uint16_t p = audio_ah_out_peak();
             const uint16_t pct = (uint16_t)((p * 100u) / 127u);
             snprintf(line, n, "AH: %u%% %s", pct, (p > 0) ? "ACT" : "idle");
+            break;
+        }
+        case 13:
+            snprintf(line, n, "Drop %lu/%lu/%lu", (unsigned long)audio_fifo_drops(),
+                     (unsigned long)opus_fifo_drops(), (unsigned long)audio_hap_drops());
+            break;
+        case 14:
+            snprintf(line, n, "PLC: %lu", (unsigned long)audio_mic_plc_frames());
+            break;
+        case 15:
+            snprintf(line, n, "c1 %lu enc %lu", (unsigned long)audio_c1_loops(), (unsigned long)audio_c1_enc());
+            break;
+        case 16:
+            snprintf(line, n, "raw/hap %lu/%lu", (unsigned long)audio_raw_push(), (unsigned long)audio_hap_push());
+            break;
+        case 17: {
+            snprintf(line, n, "Flash %lu fail %lu", (unsigned long)g_fse_calls, (unsigned long)g_fse_fail);
             break;
         }
         default:
@@ -1937,7 +1956,7 @@ void settings_adjust(int delta) {
     if (it.flags & SIF_FLOAT10) { // Hap Gain：float 字段（packed 偏移不对齐，走 memcpy）
         float f;
         memcpy(&f, p, sizeof f);
-        int v = (int)(f * 10.0f + 0.5f) + delta;
+        int v = (int)(f * 10.0f + 0.5f) + delta * it.step;
         if (v < it.lo) v = it.lo;
         if (v > it.hi) v = it.hi;
         f = v / 10.0f;
@@ -1946,6 +1965,10 @@ void settings_adjust(int delta) {
     }
 
     int v = (int)*p + delta * (it.step ? it.step : 1);
+    if (it.flags & SIF_GRID) {
+        v = delta > 0 ? ((int)*p / it.step + 1) * it.step
+                      : (((int)*p + it.step - 1) / it.step - 1) * it.step;
+    }
     if (it.flags & SIF_PIN) { // StatPin：只停在合法且未被 OLED 占用的脚（0xFF=off 也是档位）
         for (int tries = 0; tries < 64; tries++) {
             if (v < 0) v = 255;
@@ -2341,6 +2364,18 @@ void render_dim_pulse(uint32_t dim_elapsed_us) {
 }
 
 void oled_loop() {
+    static uint32_t seen_host_config_gen = 0;
+    const uint32_t host_gen = cmd_host_config_gen();
+    if (host_gen != seen_host_config_gen) {
+        seen_host_config_gen = host_gen;
+        lightbar_load_config();
+        bright_idx = get_config().screen_brightness;
+        // Host writes win over an unfinished OLED edit, as in upstream.
+        settings_local = get_config();
+        settings_init_done = false;
+        settings_dirty = false;
+        g_fb_generation++;
+    }
     handle_buttons();
     const uint32_t now = fast_now_us();   // 每轮调用：省掉 time_us_32 的函数调用（见 fast_time.h）
     rumble_burst_tick(now);

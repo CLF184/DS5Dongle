@@ -33,6 +33,9 @@
 #endif
 #include "slots.h"
 
+static SetStateData initial_state{};
+static bool initial_state_pending = false;
+
 #define MTU_CONTROL 672
 #define MTU_INTERRUPT 672
 
@@ -146,7 +149,7 @@ bool bt_disconnect() {
     return true;
 }
 
-bool bt_is_connected() {
+bool __not_in_flash_func(bt_is_connected)() {
     return hid_interrupt_cid != 0;
 }
 
@@ -692,6 +695,8 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
         }
 
         case HCI_EVENT_DISCONNECTION_COMPLETE: {
+            initial_state_pending = false;
+            audio_on_bt_disconnected();
 #if !ENABLE_SERIAL
             // Hide the USB device when no controller is paired (upstream behavior), EXCEPT when
             // wake is on (stay on the bus so a returning controller can signal a host wake) or
@@ -873,6 +878,8 @@ static void __not_in_flash_func(l2cap_packet_handler)(uint8_t packet_type, uint1
                         .LedBlue = 0x00,
                     };
                     update_state(state);
+                    initial_state = state;
+                    initial_state_pending = true;
 
                     // Re-arm controller mic streaming for the new link. The 0x32
                     // mic-status packet is otherwise only sent when the host opens
@@ -1081,7 +1088,32 @@ void init_feature() {
     get_feature_data(0x05, 41);
 }
 
+// Retain the direct-output architecture: replay only initialization fields which
+// no newer host/OLED/configuration report has already superseded.
+void bt_note_state(const SetStateData &state) {
+    if (!initial_state_pending) return;
+    if (state.AllowAudioControl) initial_state.AllowAudioControl = 0;
+    if (state.AllowLedColor || state.ResetLights) initial_state.AllowLedColor = 0;
+    if (state.AllowLightBrightnessChange || state.ResetLights) initial_state.AllowLightBrightnessChange = 0;
+    if (state.AllowColorLightFadeAnimation || state.ResetLights) initial_state.AllowColorLightFadeAnimation = 0;
+}
+
+void bt_initial_state_task() {
+    if (!initial_state_pending || !bt_is_connected() || !tud_mounted()) return;
+    uint8_t pkt[142]{};
+    pkt[0] = 0x32;
+    pkt[1] = 0x10;
+    pkt[2] = 0x90;
+    pkt[3] = 0x3f;
+    memcpy(pkt + 4, &initial_state, sizeof(initial_state));
+    if (bt_try_write(pkt, sizeof(pkt))) {
+        initial_state_pending = false;
+        update_mic_status();
+    }
+}
+
 void update_state(const SetStateData &state) {
+    bt_note_state(state);
     uint8_t pkt[142]{};
     pkt[0] = 0x32;
     pkt[1] = 0x10;

@@ -355,6 +355,9 @@ target_compile_definitions(ds5-bridge PRIVATE
         FIRMWARE_VERSION="${VERSION}"
 )
 
+# Cover every flash writer, including BTstack, before core1 registers for lockout.
+target_link_options(ds5-bridge PRIVATE "LINKER:--wrap=flash_safe_execute")
+
 pico_set_program_name(ds5-bridge "ds5-bridge")
 pico_set_program_version(ds5-bridge "${VERSION}")
 

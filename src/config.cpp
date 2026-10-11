@@ -25,6 +25,7 @@ bool is_dse = false;
 // 编译期保护
 // 判断Config结构体是否能放进flash 256bytes
 static_assert(sizeof(Config) <= FLASH_PAGE_SIZE);
+static_assert(sizeof(Config_body) == 43, "Keep the v5 persisted configuration layout");
 // 配置区起始地址必须按 flash sector 对齐。
 static_assert(CONFIG_FLASH_OFFSET % FLASH_SECTOR_SIZE == 0);
 
@@ -70,7 +71,7 @@ void config_valid() {
     }
     // ---- 共享字段：按上游的顺序与写法排列（rebase 友好）。仅两处默认值按 fork 需要
     //      偏离：speaker_gain 用 0（=auto，不强制预增益）、enable_usb_sn 用 1（带序列号）。----
-    if (std::isnan(body->haptics_gain) || body->haptics_gain < 1.0f || body->haptics_gain > 2.0f) {
+    if (std::isnan(body->haptics_gain) || body->haptics_gain < 1.0f || body->haptics_gain > 6.0f) {
         body->haptics_gain = 1.0f;
         printf("[Config] Haptics Gain value is invalid\n");
     }
@@ -148,8 +149,8 @@ void config_valid() {
         printf("[Config] current_slot is invalid\n");
     }
     if (body->auto_haptics_enable > 3) {
-        body->auto_haptics_enable = 1; // Fallback default
-        printf("[Config] auto_haptics_enable invalid, defaulting to 1 (Fallback)\n");
+        body->auto_haptics_enable = 0; // Off for new/default configurations
+        printf("[Config] auto_haptics_enable invalid, defaulting to 0 (Off)\n");
     }
     if (body->auto_haptics_gain > 200) {
         body->auto_haptics_gain = 100;
@@ -232,7 +233,7 @@ bool config_save() {
     return false;
 }
 
-Config_body& get_config() {
+Config_body& __not_in_flash_func(get_config)() {
     return config.body;
 }
 

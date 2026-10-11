@@ -23,5 +23,5 @@ jobs:
       version: ${{ github.event.release.tag_name || inputs.tag }}
       asset_suffix: -${{ github.event.release.tag_name || inputs.tag }}
       upload_tag: ${{ github.event.release.tag_name || inputs.tag }}
-      picow: true
+      picow: false
       waveshare: true

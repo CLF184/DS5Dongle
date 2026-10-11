@@ -116,11 +116,12 @@ static bool audio10_set_req_entity(tusb_control_request_t const *p_request, uint
 
                         volume[index] = static_cast<float>(*reinterpret_cast<int16_t const *>(pBuff)) / 256;
                         if (entityID == UAC1_ENTITY_SPK_FEATURE_UNIT) {
+                            const float amp = std::clamp(100.0f + volume[index], 0.0f, 100.0f);
                             SetStateData state = {
                                 .AllowHeadphoneVolume = 1,
                                 .AllowSpeakerVolume = 1,
-                                .VolumeHeadphones = static_cast<uint8_t>(100.0f + volume[index]),
-                                .VolumeSpeaker = static_cast<uint8_t>(100.0f + volume[index]),
+                                .VolumeHeadphones = static_cast<uint8_t>(amp),
+                                .VolumeSpeaker = static_cast<uint8_t>(amp),
                             };
                             update_state(state);
                         }
@@ -269,3 +270,7 @@ void tud_resume_cb(void) {
 #endif
 }
 #endif // !ENABLE_WAKE_HID
+
+void tud_umount_cb() {
+    set_mic_active(false);
+}

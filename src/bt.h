@@ -44,6 +44,8 @@ void bt_bootsel_click_action();
 void bt_bootsel_hold_action();
 void bt_blacklist_persist_if_dirty();
 void update_state(const SetStateData& state);
+void bt_note_state(const SetStateData& state);
+void bt_initial_state_task();
 
 // Connection-attempt watchdog: call once per main-loop iteration. Recovers a
 // stalled connection (auto re-inquiry) so a transient RF glitch — e.g. USB 3.0

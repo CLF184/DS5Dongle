@@ -9,8 +9,8 @@
 
 struct __attribute__((packed)) Config_body {
     uint8_t config_version; // Config Version
-    float haptics_gain; // [1.0,2.0]
-    uint8_t speaker_volume; // [0,127] // unused
+    float haptics_gain; // [1.0,6.0]
+    uint8_t speaker_volume; // 100 = 0 dB; OLED supports 0..112 (+12 dB)
     uint8_t headset_volume; // [0,127] // max 0x7f // unused
     uint8_t speaker_gain; // [0,7] (0: auto)
     uint8_t inactive_time; // [0,60] min (0: disable)
@@ -30,7 +30,7 @@ struct __attribute__((packed)) Config_body {
     // ---- 以下为 OLED Edition 特有字段（上游没有；一律追加在末尾，别插到上面去）----
     uint8_t current_slot;    // [0..3] 当前多槽位配对槽（Phase G）
     // Audio Auto Haptics：从扬声器音频派生的触觉（DSP 借自 loteran/DS5Dongle 5d6bc2f）
-    uint8_t auto_haptics_enable;  // 0=Off, 1=Fallback (default), 2=Mix, 3=Replace
+    uint8_t auto_haptics_enable;  // 0=Off (default), 1=Fallback, 2=Mix, 3=Replace
     uint8_t auto_haptics_gain;    // [0,200] percent, default 100
     uint8_t auto_haptics_lowpass; // 0=80Hz, 1=160Hz (default), 2=250Hz, 3=400Hz
     // Lightbar：灯条模式/收藏色（编号与 oled.cpp 的 kNumLbModes/kLbModeHost 同步）
