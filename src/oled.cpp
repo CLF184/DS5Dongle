@@ -2074,6 +2074,7 @@ void settings_handle_input() {
             const bool sn_changed = ((get_config().enable_usb_sn != 0)
                                      != (settings_local.enable_usb_sn != 0));
             const bool mode_changed = get_config().controller_mode != settings_local.controller_mode;
+            const bool mic_turned_off = get_config().mic_select != 3 && settings_local.mic_select == 3;
 #ifdef ENABLE_WAKE_HID
             // enable_wake / ps_shortcut_enabled 改变 USB 枚举面（bcdUSB 2.1 + BOS +
             // 键盘接口 / remote-wakeup 位），保存后必须重新枚举才生效。
@@ -2082,6 +2083,8 @@ void settings_handle_input() {
                 || (get_config().ps_shortcut_enabled != settings_local.ps_shortcut_enabled);
 #endif
             set_config(settings_local);
+            // Stop the controller mic even when no speaker audio is flowing.
+            if (mic_turned_off) update_mic_status();
             bright_idx = get_config().screen_brightness;
             // 原来靠比较状态串前缀（"Sa..."）判断成功 —— 但 "Save FAIL" 也匹配，
             // 保存失败时同样会清 dirty 并触发重挂载。改成直接用返回值。
