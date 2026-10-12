@@ -160,7 +160,7 @@ enum : uint8_t { ACT_NONE = 0, ACT_RESET, ACT_WIPE };
 enum : uint8_t {
     SIF_WRAP    = 1u << 0, // lo..hi 环绕（枚举项）；否则 clamp
     SIF_SNAP    = 1u << 1, // 档位吸附：0 或 >=10（Inact 空闲超时）
-    SIF_FLOAT10 = 1u << 2, // 字段是 float，按 ×10 处理（Hap Gain；packed 偏移不对齐，走 memcpy）
+    SIF_FLOAT10 = 1u << 2, // 字段是 float，按 ×10 处理（packed 偏移不对齐，走 memcpy）
     SIF_GRID    = 1u << 4, // snap to step grid, including the +12 dB endpoint
     SIF_PIN     = 1u << 3, // status_gpio：0xFF=off 且调值时跳过不可选脚
 };
@@ -185,10 +185,12 @@ static const char* const kAHLp[]     = {"80Hz", "160Hz", "250Hz", "400Hz"};
 static const char* const kMicSel[]   = {"auto", "Int", "Ext", "Off"};
 static const char* const kSpkOut[]   = {"Auto", "Builtin", "Headset", "Off"};
 static const char* const kStatMode[] = {"Level", "Pulse"};
+static const char* const kBrightness[] = {"Max", "High", "Mid", "Low"};
 
 #define CFG_OFF(field) ((uint8_t)offsetof(Config_body, field))
 static const SetItem kSetItems[] = {
-    {"Hap Gain", nullptr, nullptr, nullptr,    SK_NUM,  SF_PLAIN, SIF_FLOAT10, ACT_NONE, CFG_OFF(haptics_gain),           0, 10, 60, 5},
+    {"Hap L",    nullptr, nullptr, nullptr,    SK_NUM,  SF_PLAIN, SIF_FLOAT10, ACT_NONE, CFG_OFF(haptics_gain),           0, 10, 60, 5},
+    {"Hap R",    nullptr, nullptr, nullptr,    SK_NUM,  SF_PLAIN, SIF_FLOAT10, ACT_NONE, CFG_OFF(haptics_gain_right),     0, 10, 60, 5},
     {"Spk Vol",  "dB",    nullptr, nullptr,    SK_NUM,  SF_PLAIN, SIF_GRID,    ACT_NONE, CFG_OFF(speaker_volume),        -100, 0, 112, 5},
     {"Inact",    "min",   nullptr, nullptr,    SK_NUM,  SF_OFF0,  SIF_SNAP,    ACT_NONE, CFG_OFF(inactive_time),         0, 0, 60, 5},
     {"Pico LED", nullptr, nullptr, kPicoLed,   SK_BOOL, SF_PLAIN, 0,           ACT_NONE, CFG_OFF(disable_pico_led),      0, 0, 1, 1},
@@ -200,6 +202,7 @@ static const SetItem kSetItems[] = {
     {"AH LP",    nullptr, nullptr, kAHLp,      SK_NUM,  SF_PLAIN, SIF_WRAP,    ACT_NONE, CFG_OFF(auto_haptics_lowpass),  0, 0, 3, 1},
     {"ScrDim",   "min",   nullptr, nullptr,    SK_NUM,  SF_OFF0,  0,           ACT_NONE, CFG_OFF(screen_dim_timeout),    0, 0, 250, 1},
     {"ScrOff",   "min",   nullptr, nullptr,    SK_NUM,  SF_OFF0,  0,           ACT_NONE, CFG_OFF(screen_off_timeout),    0, 0, 250, 1},
+    {"Bright",   nullptr, nullptr, kBrightness, SK_NUM, SF_PLAIN, SIF_WRAP,    ACT_NONE, CFG_OFF(screen_brightness),     0, 0, 3, 1},
     {"CtrlWake", nullptr, nullptr, nullptr,    SK_BOOL, SF_PLAIN, 0,           ACT_NONE, CFG_OFF(controller_wakes_display), 0, 0, 1, 1},
     {"TrigRdc",  nullptr, nullptr, nullptr,    SK_NUM,  SF_AUTO0, SIF_WRAP,    ACT_NONE, CFG_OFF(trigger_reduce),        0, 0, 10, 1},
     {"SpkGain",  nullptr, nullptr, nullptr,    SK_NUM,  SF_AUTO0, SIF_WRAP,    ACT_NONE, CFG_OFF(speaker_gain),          0, 0, 7, 1},
@@ -1956,7 +1959,7 @@ void settings_adjust(int delta) {
         *p ^= 1;
         return;
     }
-    if (it.flags & SIF_FLOAT10) { // Hap Gain：float 字段（packed 偏移不对齐，走 memcpy）
+    if (it.flags & SIF_FLOAT10) { // 独立调整选中侧；packed 字段通过 memcpy 读写。
         auto step = [&](float g) {
             int v = (int)(g * 10.0f + 0.5f) + delta * it.step;
             if (v < it.lo) v = it.lo;
@@ -1967,10 +1970,6 @@ void settings_adjust(int delta) {
         memcpy(&f, p, sizeof f);
         f = step(f);
         memcpy(p, &f, sizeof f);
-        // Same OLED interaction as upstream: move both, preserving their difference.
-        if (it.off == offsetof(Config_body, haptics_gain)) {
-            settings_local.haptics_gain_right = step(settings_local.haptics_gain_right);
-        }
         return;
     }
 
@@ -2003,6 +2002,29 @@ void settings_adjust(int delta) {
     *p = (uint8_t)v;
 }
 
+void settings_session_tick() {
+    if (current_screen == kScreenSettings) {
+        if (!settings_init_done) {
+            settings_local = get_config();
+            settings_dirty = false;
+            settings_init_done = true;
+        }
+        return;
+    }
+    if (!settings_init_done) return;
+
+    // Leaving Settings discards unsaved edits. Re-entering takes a fresh
+    // snapshot before input, even when rendering is paced or the panel sleeps.
+    settings_init_done = false;
+    settings_dirty = false;
+    settings_save_status = "";
+    settings_status_until_us = 0;
+    settings_last_dpad = 8;
+    settings_last_face = 0;
+    settings_tri_press_us = 0;
+    settings_reset_triggered = false;
+}
+
 void settings_handle_input() {
     if (!bt_is_connected()) return;
     const uint8_t dpad = (uint8_t)(interrupt_in_data[7] & 0x0F);
@@ -2032,6 +2054,7 @@ void settings_handle_input() {
         if (kSetItems[settings_sel].act == ACT_RESET) {
             const uint8_t previous_mode = get_config().controller_mode;
             config_default();
+            bright_idx = get_config().screen_brightness;
             if (config_save()) {
                 settings_local = get_config();
                 lightbar_load_config(); // refresh RAM lightbar state (no reboot here)
@@ -2059,6 +2082,7 @@ void settings_handle_input() {
                 || (get_config().ps_shortcut_enabled != settings_local.ps_shortcut_enabled);
 #endif
             set_config(settings_local);
+            bright_idx = get_config().screen_brightness;
             // 原来靠比较状态串前缀（"Sa..."）判断成功 —— 但 "Save FAIL" 也匹配，
             // 保存失败时同样会清 dirty 并触发重挂载。改成直接用返回值。
             const bool saved = config_save();
@@ -2104,11 +2128,6 @@ __attribute__((noinline)) void format_settings_item(int idx, char* line, size_t 
         float f;
         memcpy(&f, base + it.off, sizeof f);
         const int g = (int)(f * 10.0f + 0.5f);
-        const int r = (int)(settings_local.haptics_gain_right * 10.0f + 0.5f);
-        if (it.off == offsetof(Config_body, haptics_gain) && g != r) {
-            snprintf(line, n, "%s Hap L%d.%d R%d.%d", cur, g / 10, g % 10, r / 10, r % 10);
-            return;
-        }
         snprintf(val, sizeof val, "%d.%dx", g / 10, g % 10);
     } else if (it.flags & SIF_PIN) {
         if (v == STATUS_GPIO_DISABLED) snprintf(val, sizeof val, "off");
@@ -2126,10 +2145,6 @@ __attribute__((noinline)) void format_settings_item(int idx, char* line, size_t 
 }
 
 __attribute__((noinline)) void render_screen_settings() {
-    if (!settings_init_done) {
-        settings_local = get_config();
-        settings_init_done = true;
-    }
     // Input is sampled by screen_input_tick() every loop iteration, not here.
 
     fb_clear();
@@ -2394,6 +2409,7 @@ void oled_loop() {
         g_fb_generation++;
     }
     handle_buttons();
+    settings_session_tick();
     const uint32_t now = fast_now_us();   // 每轮调用：省掉 time_us_32 的函数调用（见 fast_time.h）
     rumble_burst_tick(now);
     // Boot splash still on the panel: keep the main loop (USB / BT / audio)
