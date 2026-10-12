@@ -1,6 +1,6 @@
 # 更新记录
 
-## v0.9.0
+## v0.8.4
 
 以本项目 v0.8.3 为基础，移植 OLED Edition
 [v0.7.0](https://github.com/MarcelineVPQ/DS5Dongle-OLED-Edition/releases/tag/v0.7.0-oled-edition)
