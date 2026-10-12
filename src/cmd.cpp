@@ -75,6 +75,26 @@ extern volatile uint32_t g_fse_calls, g_fse_fail, g_setfeat_count, g_setfeat_las
 static uint32_t host_config_gen = 0;
 uint32_t cmd_host_config_gen() { return host_config_gen; }
 
+// Grip preview only, following upstream 0xF6/0x0E. Run after the USB callback.
+static uint8_t pending_grip_test = 0xff;
+static uint64_t rumble_stop_us = 0;
+void cmd_on_bt_disconnected() {
+    pending_grip_test = 0xff;
+    rumble_stop_us = 0;
+}
+void cmd_task() {
+    if (!bt_is_connected()) { cmd_on_bt_disconnected(); return; }
+    if (pending_grip_test != 0xff) {
+        const uint8_t left = pending_grip_test != 1 ? bt_scale_rumble(64, get_config().haptics_gain) : 0;
+        const uint8_t right = pending_grip_test != 0 ? bt_scale_rumble(64, get_config().haptics_gain_right) : 0;
+        if (bt_send_rumble(left, right)) {
+            pending_grip_test = 0xff;
+            rumble_stop_us = time_us_64() + 500000;
+        }
+    }
+    if (rumble_stop_us && time_us_64() >= rumble_stop_us && bt_send_rumble(0, 0)) rumble_stop_us = 0;
+}
+
 bool is_pico_cmd(uint8_t report_id) {
     if (report_id == 0xf5 ||
         report_id == 0xf6 ||
@@ -286,6 +306,11 @@ void pico_cmd_set(uint8_t report_id, uint8_t const *buffer, uint16_t bufsize) {
     // 0x01 update config in variable
     // 0x02 write config to flash
     // 0x03 reconnect tinyusb device;
+    // 0x0E grip preview: 0 left, 1 right, 2 both (~0.5 seconds)
+    if (buffer[0] == 0x0e) {
+        if (bufsize >= 2 && buffer[1] <= 2 && bt_is_connected()) pending_grip_test = buffer[1];
+        return;
+    }
     if (buffer[0] == 0x01) {
 #if ENABLE_VERBOSE
         printf("[CMD] Enter config set func\n");

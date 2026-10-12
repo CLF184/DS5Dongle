@@ -9,7 +9,7 @@
 
 struct __attribute__((packed)) Config_body {
     uint8_t config_version; // Config Version
-    float haptics_gain; // [1.0,6.0]
+    float haptics_gain; // [1.0,6.0] left grip
     uint8_t speaker_volume; // 100 = 0 dB; OLED supports 0..112 (+12 dB)
     uint8_t headset_volume; // [0,127] // max 0x7f // unused
     uint8_t speaker_gain; // [0,7] (0: auto)
@@ -45,6 +45,8 @@ struct __attribute__((packed)) Config_body {
     uint8_t screen_brightness;
     // 0 = 手柄输入不再唤醒 OLED（只有 OLED 自己的按键会）
     uint8_t controller_wakes_display;
+    // Appended: old 43-byte configurations retain every previous field.
+    float haptics_gain_right; // [1.0,6.0], defaults to the left grip on migration
 };
 
 struct __attribute__((packed)) Config {

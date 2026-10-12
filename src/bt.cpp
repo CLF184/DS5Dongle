@@ -3,6 +3,7 @@
 //
 
 #include <cstdio>
+#include <cstddef>
 #include <cstring>
 #include "bt.h"
 #include <queue>
@@ -24,6 +25,8 @@
 #include "fake_ds5.h"
 #include "wake.h"
 #include "usb.h"
+#include "xbox_usb.h"
+#include "cmd.h"
 #include "pico/util/queue.h"
 #if ENABLE_BATT_LED
 #include "battery_led.h"
@@ -35,6 +38,10 @@
 
 static SetStateData initial_state{};
 static bool initial_state_pending = false;
+// Only the rumble fields are latched. Upstream state_stamp_host_rumble(),
+// adapted to this fork's direct report forwarding (including Xbox GIP).
+static uint8_t host_rumble_flags0 = 0, host_rumble_flags38 = 0;
+static uint8_t host_rumble_left = 0, host_rumble_right = 0;
 
 #define MTU_CONTROL 672
 #define MTU_INTERRUPT 672
@@ -697,6 +704,8 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
         case HCI_EVENT_DISCONNECTION_COMPLETE: {
             initial_state_pending = false;
             audio_on_bt_disconnected();
+            bt_clear_host_rumble();
+            cmd_on_bt_disconnected();
 #if !ENABLE_SERIAL
             // Hide the USB device when no controller is paired (upstream behavior), EXCEPT when
             // wake is on (stay on the bus so a returning controller can signal a host wake) or
@@ -716,6 +725,8 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
             bt_rssi = 0;
             hid_control_cid = 0;
             hid_interrupt_cid = 0;
+            xbox_usb_stop();
+            xbox_usb_flush(); // drop a pending GIP output from the old link
             gpio_on_disconnect();
             wake_on_bt_disconnect();
 #if !ENABLE_SERIAL
@@ -841,7 +852,7 @@ static void __not_in_flash_func(l2cap_packet_handler)(uint8_t packet_type, uint1
                     const auto mtu = l2cap_get_remote_mtu_for_local_cid(hid_control_cid);
                     printf("[L2CAP] Remote Control MTU: %d\n", mtu);
 
-                    if (new_pair) {
+                    if (new_pair && hid_interrupt_cid == 0) {
                         printf("[L2CAP] Opening interrupt channel\n");
                         l2cap_create_channel(l2cap_packet_handler, current_device_addr, PSM_HID_INTERRUPT,
                                              MTU_INTERRUPT,
@@ -1088,6 +1099,45 @@ void init_feature() {
     get_feature_data(0x05, 41);
 }
 
+uint8_t bt_scale_rumble(uint8_t value, float gain) {
+    const int scaled = static_cast<int>(static_cast<float>(value) * gain + 0.5f);
+    return static_cast<uint8_t>(scaled > 255 ? 255 : scaled);
+}
+
+void bt_remember_host_rumble(const SetStateData &state) {
+    const auto *bytes = reinterpret_cast<const uint8_t *>(&state);
+    host_rumble_flags0 = bytes[0] & 0x03;
+    host_rumble_flags38 = bytes[38] & 0x0c;
+    host_rumble_left = state.RumbleEmulationLeft;
+    host_rumble_right = state.RumbleEmulationRight;
+}
+
+void bt_stamp_host_rumble(uint8_t *bytes) {
+    bytes[0] = (bytes[0] & ~0x03) | host_rumble_flags0;
+    bytes[38] = (bytes[38] & ~0x0c) | host_rumble_flags38;
+    bytes[offsetof(SetStateData, RumbleEmulationLeft)] = host_rumble_left;
+    bytes[offsetof(SetStateData, RumbleEmulationRight)] = host_rumble_right;
+}
+
+void bt_clear_host_rumble() {
+    host_rumble_flags0 = host_rumble_flags38 = 0;
+    host_rumble_left = host_rumble_right = 0;
+}
+
+bool bt_send_rumble(uint8_t left, uint8_t right) {
+    extern uint8_t reportSeqCounter;
+    uint8_t pkt[78]{};
+    pkt[0] = 0x31;
+    pkt[1] = reportSeqCounter << 4;
+    pkt[2] = 0x10;
+    pkt[3] = 0x03;
+    pkt[3 + offsetof(SetStateData, RumbleEmulationLeft)] = left;
+    pkt[3 + offsetof(SetStateData, RumbleEmulationRight)] = right;
+    if (!bt_try_write(pkt, sizeof(pkt))) return false;
+    reportSeqCounter = (reportSeqCounter + 1) & 0x0f;
+    return true;
+}
+
 // Retain the direct-output architecture: replay only initialization fields which
 // no newer host/OLED/configuration report has already superseded.
 void bt_note_state(const SetStateData &state) {
@@ -1106,6 +1156,7 @@ void bt_initial_state_task() {
     pkt[2] = 0x90;
     pkt[3] = 0x3f;
     memcpy(pkt + 4, &initial_state, sizeof(initial_state));
+    bt_stamp_host_rumble(pkt + 4);
     if (bt_try_write(pkt, sizeof(pkt))) {
         initial_state_pending = false;
         update_mic_status();
@@ -1120,5 +1171,6 @@ void update_state(const SetStateData &state) {
     pkt[2] = 0x90;
     pkt[3] = 0x3f;
     memcpy(pkt + 4, &state, sizeof(SetStateData));
+    bt_stamp_host_rumble(pkt + 4);
     bt_write(pkt, sizeof(pkt));
 }

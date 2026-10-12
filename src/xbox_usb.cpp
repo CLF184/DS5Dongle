@@ -41,6 +41,9 @@ void apply(void *, const xbox::Motors &motors) {
         state.AllowMotorPowerLevel = 1;
         state.TriggerMotorPowerReduction = get_config().trigger_reduce;
     }
+    state.RumbleEmulationLeft = bt_scale_rumble(state.RumbleEmulationLeft, get_config().haptics_gain);
+    state.RumbleEmulationRight = bt_scale_rumble(state.RumbleEmulationRight, get_config().haptics_gain_right);
+    bt_remember_host_rumble(state);
     pending_state = state;
     output_pending = true;
     xbox_usb_flush();

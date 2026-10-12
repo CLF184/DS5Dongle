@@ -5,6 +5,7 @@
 #include "config.h"
 
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 
 #include "bt.h"
@@ -25,7 +26,8 @@ bool is_dse = false;
 // 编译期保护
 // 判断Config结构体是否能放进flash 256bytes
 static_assert(sizeof(Config) <= FLASH_PAGE_SIZE);
-static_assert(sizeof(Config_body) == 43, "Keep the v5 persisted configuration layout");
+static_assert(offsetof(Config_body, haptics_gain_right) == 43, "Keep the v5 configuration prefix");
+static_assert(sizeof(Config_body) == 47, "Append only the right grip gain");
 // 配置区起始地址必须按 flash sector 对齐。
 static_assert(CONFIG_FLASH_OFFSET % FLASH_SECTOR_SIZE == 0);
 
@@ -60,6 +62,11 @@ void config_valid() {
         }
     }
     if (config.size != sizeof(Config_body)) {
+        // Ignore bytes beyond the saved body: an old page need not have an erased tail.
+        if (config.size < sizeof(Config_body)) {
+            memset(reinterpret_cast<uint8_t *>(&config.body) + config.size, 0xff,
+                   sizeof(Config_body) - config.size);
+        }
         config.size = sizeof(Config_body);
         printf("[Config] Config Body size is invalid\n");
     }
@@ -74,6 +81,9 @@ void config_valid() {
     if (std::isnan(body->haptics_gain) || body->haptics_gain < 1.0f || body->haptics_gain > 6.0f) {
         body->haptics_gain = 1.0f;
         printf("[Config] Haptics Gain value is invalid\n");
+    }
+    if (std::isnan(body->haptics_gain_right) || body->haptics_gain_right < 1.0f || body->haptics_gain_right > 6.0f) {
+        body->haptics_gain_right = body->haptics_gain;
     }
     if (body->speaker_volume > 127) {
         body->speaker_volume = 100; // 100 = 0dB

@@ -372,6 +372,7 @@ void __not_in_flash_func(audio_loop)() {
     const float audio_gain = mute[0] ? 0.0f
                                      : powf(10.0f, ((int) cfg.speaker_volume - 100) / 20.0f);
     const float haptics_gain = cfg.haptics_gain;
+    const float haptics_gain_right = cfg.haptics_gain_right;
 #if !DISABLE_SPEAKER_PROC
     if (!speaker_enabled) {
         audio_buf_pos = 0;
@@ -454,7 +455,7 @@ void __not_in_flash_func(audio_loop)() {
     // 4. 转换为int8并缓冲，满64字节即组包发送
     for (int i = 0; i < out_frames; i++) {
         int val_l = static_cast<int>(out_buf[i * 2] * 127.0f * haptics_gain);
-        int val_r = static_cast<int>(out_buf[i * 2 + 1] * 127.0f * haptics_gain);
+        int val_r = static_cast<int>(out_buf[i * 2 + 1] * 127.0f * haptics_gain_right);
         haptic_buf[haptic_buf_pos++] = static_cast<int8_t>(clamp(val_l, -128, 127));
         haptic_buf[haptic_buf_pos++] = static_cast<int8_t>(clamp(val_r, -128, 127));
 

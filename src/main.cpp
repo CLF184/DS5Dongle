@@ -453,6 +453,9 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
                 memcpy(&state,buffer + 1,sizeof(SetStateData));
 
                 const auto &config = get_config();
+                state.RumbleEmulationLeft = bt_scale_rumble(state.RumbleEmulationLeft, config.haptics_gain);
+                state.RumbleEmulationRight = bt_scale_rumble(state.RumbleEmulationRight, config.haptics_gain_right);
+                bt_remember_host_rumble(state);
                 if (config.trigger_reduce > 0) {
                     state.AllowMotorPowerLevel = 1;
                     state.TriggerMotorPowerReduction = config.trigger_reduce;
@@ -615,6 +618,7 @@ int main() {
         bt_connection_watchdog_tick();
         tud_task();
         xbox_usb_flush();
+        cmd_task();
         bt_initial_state_task();
         wake_task();
         if (!usb_xbox_mode) audio_loop();

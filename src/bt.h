@@ -46,6 +46,12 @@ void bt_blacklist_persist_if_dirty();
 void update_state(const SetStateData& state);
 void bt_note_state(const SetStateData& state);
 void bt_initial_state_task();
+// Latest game rumble, after grip gain. Core0 only; never repeats trigger state.
+void bt_remember_host_rumble(const SetStateData& state);
+void bt_stamp_host_rumble(uint8_t *state_bytes);
+void bt_clear_host_rumble();
+uint8_t bt_scale_rumble(uint8_t value, float gain);
+bool bt_send_rumble(uint8_t left, uint8_t right);
 
 // Connection-attempt watchdog: call once per main-loop iteration. Recovers a
 // stalled connection (auto re-inquiry) so a transient RF glitch — e.g. USB 3.0

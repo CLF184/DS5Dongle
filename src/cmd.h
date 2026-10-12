@@ -20,5 +20,7 @@ uint16_t cpu_temp_raw_smoothed();
 
 // Incremented only when the host applies a configuration (OLED cache invalidation).
 uint32_t cmd_host_config_gen();
+void cmd_task();
+void cmd_on_bt_disconnected();
 
 #endif //DS5_BRIDGE_CMD_H

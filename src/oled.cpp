@@ -329,6 +329,7 @@ void sh1107_init() {
     cmd(0xB0);
     cmd(0xDC); cmd(0x00);
     cmd(0x81); cmd(0x6F);
+    current_contrast = 0x6F;
     cmd(0x21);
     cmd(0xA0);
     cmd(0xC0);
@@ -588,8 +589,8 @@ void send_rumble(uint8_t amplitude) {
     pkt[1] = 0x00;
     pkt[2] = 0x10;
     pkt[3] = 0x03;
-    pkt[5] = amplitude;
-    pkt[6] = amplitude;
+    pkt[5] = bt_scale_rumble(amplitude, get_config().haptics_gain_right);
+    pkt[6] = bt_scale_rumble(amplitude, get_config().haptics_gain);
     bt_write(pkt, sizeof(pkt));
 }
 
@@ -687,6 +688,7 @@ void send_trigger_effect(int preset) {
     pkt[24] = mode;
     for (int i = 0; i < 9; i++) pkt[25 + i] = p[i];
 
+    bt_stamp_host_rumble(pkt + 3);
     bt_write(pkt, sizeof(pkt));
 }
 
@@ -1645,6 +1647,7 @@ void send_lightbar_color(uint8_t r, uint8_t g, uint8_t b) {
     pkt[47] = r;   // lightbar_red
     pkt[48] = g;   // lightbar_green
     pkt[49] = b;   // lightbar_blue
+    bt_stamp_host_rumble(pkt + 3);
     bt_write(pkt, sizeof(pkt));
 }
 
@@ -1954,13 +1957,20 @@ void settings_adjust(int delta) {
         return;
     }
     if (it.flags & SIF_FLOAT10) { // Hap Gain：float 字段（packed 偏移不对齐，走 memcpy）
+        auto step = [&](float g) {
+            int v = (int)(g * 10.0f + 0.5f) + delta * it.step;
+            if (v < it.lo) v = it.lo;
+            if (v > it.hi) v = it.hi;
+            return v / 10.0f;
+        };
         float f;
         memcpy(&f, p, sizeof f);
-        int v = (int)(f * 10.0f + 0.5f) + delta * it.step;
-        if (v < it.lo) v = it.lo;
-        if (v > it.hi) v = it.hi;
-        f = v / 10.0f;
+        f = step(f);
         memcpy(p, &f, sizeof f);
+        // Same OLED interaction as upstream: move both, preserving their difference.
+        if (it.off == offsetof(Config_body, haptics_gain)) {
+            settings_local.haptics_gain_right = step(settings_local.haptics_gain_right);
+        }
         return;
     }
 
@@ -2094,6 +2104,11 @@ __attribute__((noinline)) void format_settings_item(int idx, char* line, size_t 
         float f;
         memcpy(&f, base + it.off, sizeof f);
         const int g = (int)(f * 10.0f + 0.5f);
+        const int r = (int)(settings_local.haptics_gain_right * 10.0f + 0.5f);
+        if (it.off == offsetof(Config_body, haptics_gain) && g != r) {
+            snprintf(line, n, "%s Hap L%d.%d R%d.%d", cur, g / 10, g % 10, r / 10, r % 10);
+            return;
+        }
         snprintf(val, sizeof val, "%d.%dx", g / 10, g % 10);
     } else if (it.flags & SIF_PIN) {
         if (v == STATUS_GPIO_DISABLED) snprintf(val, sizeof val, "off");
@@ -2320,6 +2335,8 @@ void oled_init() {
 
     hw_reset();
     sh1107_init();
+    bright_idx = get_config().screen_brightness;
+    sh1107_set_contrast(kBrightLevels[bright_idx]);
     fb_clear();
     boot_splash();
 
