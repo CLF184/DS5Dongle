@@ -11,6 +11,7 @@
 #include <malloc.h>
 #include <unistd.h>
 #include "audio.h"
+#include "perf.h"
 #include "bt.h"
 #if ENABLE_DEBUG
 #include "debug.h"
@@ -653,12 +654,17 @@ void __not_in_flash_func(core1_entry)() {
     g_c1_flags |= 0x01;
     // Preserve this port's Bluetooth/USB startup delay.
     sleep_ms(300);
-    g_c1_stage = 3; // startup delay complete; this port has no perf cycle counter
+    perf_core_init();  // each core has its own cycle counter
+    g_c1_stage = 3;
     g_c1_free_heap = free_heap_bytes();
     int error = 0;
 #if !DISABLE_SPEAKER_PROC
     g_c1_stage = 4;
+#if OPUS_ENCODER_CELT_ONLY
+    encoder = opus_encoder_create(48000, 2, OPUS_APPLICATION_RESTRICTED_CELT, &error);
+#else
     encoder = opus_encoder_create(48000, 2, OPUS_APPLICATION_AUDIO, &error);
+#endif
     g_c1_stage = 5;
     if (error != 0 || encoder == nullptr) {
         printf("[Audio] OpusEncoder create failed (err=%d): speaker off\n", error);
@@ -704,11 +710,19 @@ void __not_in_flash_func(core1_entry)() {
         // which would otherwise thrash the RP2350 system bus and starve Core 0.
 #if !DISABLE_SPEAKER_PROC
         if (g_spk_ready && queue_get_level(&audio_fifo) > 0) {
+            const uint32_t t0 = perf_now();
             speaker_proc();
+            perf_record(PERF_C1_SPEAKER, perf_now() - t0);
             work_done = true;
         }
 #endif
-        if (mic_decoder != nullptr && mic_proc()) work_done = true;
+        if (mic_decoder != nullptr) {
+            const uint32_t t0 = perf_now();
+            if (mic_proc()) {
+                perf_record(PERF_C1_MIC, perf_now() - t0);
+                work_done = true;
+            }
+        }
         
         // If both queues are empty, we can safely sleep.
         // This prevents 100% CPU usage while maintaining sub-millisecond response times.

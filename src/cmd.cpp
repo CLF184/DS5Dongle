@@ -13,6 +13,7 @@
 #include "device/usbd.h"
 #include "pico/time.h"
 #include "audio.h"
+#include "perf.h"
 #include "usb.h"
 #include "slots.h"
 #include "hardware/clocks.h"
@@ -241,6 +242,8 @@ uint16_t pico_cmd_get(uint8_t report_id, uint8_t *buffer, uint16_t reqlen) {
         memcpy(buffer + 4, &cached_real_khz, 4);
         buffer[8] = vcode;
         memcpy(buffer + 9, &temp_raw,        2);
+        // Keep the old 11-byte CPU report; long reads append all eight stages.
+        if (reqlen >= want + kPerfReportBytes) return want + perf_serialize(buffer + want, kPerfReportBytes);
         return want;
     }
     if (report_id == 0xfd) {
@@ -316,6 +319,11 @@ void pico_cmd_set(uint8_t report_id, uint8_t const *buffer, uint16_t bufsize) {
     // 0x02 write config to flash
     // 0x03 reconnect tinyusb device;
     // 0x0E grip preview: 0 left, 1 right, 2 both (~0.5 seconds)
+    // Same measurement reset as the OLED Diag triangle action.
+    if (buffer[0] == 0x15) {
+        perf_reset();
+        return;
+    }
     if (buffer[0] == 0x0e) {
         if (bufsize >= 2 && buffer[1] <= 2 && bt_is_connected()) pending_grip_test = buffer[1];
         return;

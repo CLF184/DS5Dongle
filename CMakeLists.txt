@@ -126,6 +126,7 @@ add_executable(ds5-bridge
         src/oled.cpp
         src/slots.cpp
         src/ram_mem.c
+        src/perf.cpp
         src/fake_ds5.h
 )
 
@@ -152,6 +153,15 @@ set(OPUS_HARDENING OFF CACHE BOOL "libopus runtime hardening checks" FORCE)
 set(OPUS_STACK_PROTECTOR OFF CACHE BOOL "libopus stack protection" FORCE)
 set(OPUS_FORTIFY_SOURCE OFF CACHE BOOL "libopus _FORTIFY_SOURCE" FORCE)
 add_subdirectory(lib/opus)
+
+# Upstream's speaker application: CELT only saves the unused SILK state.
+# OFF retains the previous OPUS_APPLICATION_AUDIO encoder.
+option(OPUS_ENCODER_CELT_ONLY "Speaker encoder: Opus CELT-only application (RESTRICTED_CELT)" ON)
+if (OPUS_ENCODER_CELT_ONLY)
+        set(OPUS_ENCODER_CELT_ONLY_VALUE 1)
+else ()
+        set(OPUS_ENCODER_CELT_ONLY_VALUE 0)
+endif ()
 
 # Phase A.3: Move libopus to RAM via .time_critical sections.
 # libopus is built by add_subdirectory(lib/opus); the target `opus` is defined in
@@ -313,6 +323,7 @@ target_compile_definitions(ds5-bridge PRIVATE
         ENABLE_BATT_LED=${ENABLE_BATT_LED_VALUE}
         SYS_CLOCK_KHZ=${SYS_CLOCK_KHZ_VALUE}
         DISABLE_SPEAKER_PROC=${DISABLE_SPEAKER_PROC_VALUE}
+        OPUS_ENCODER_CELT_ONLY=${OPUS_ENCODER_CELT_ONLY_VALUE}
 )
 
 # DS5_UPSTREAM_HID_DESC：HID 报告描述符可选切到上游原版（321 字节、声明 F6-F9）。

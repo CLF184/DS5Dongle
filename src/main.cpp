@@ -9,6 +9,7 @@
 #include "utils.h"
 #include "resample.h"
 #include "audio.h"
+#include "perf.h"
 #include "btstack_util.h"
 #if ENABLE_DEBUG
 #include "debug.h"
@@ -597,6 +598,8 @@ int main() {
     bt_init();
     bt_register_data_callback(on_bt_data);
 
+    perf_core_init();
+    perf_reset();
     audio_init();
     oled_init();
 
@@ -605,8 +608,12 @@ int main() {
 #endif
 
     static LoopProbe probe_core0;
+    uint32_t loop_start = perf_now();
 
     while (1) {
+        const uint32_t t0 = perf_now();
+        perf_record(PERF_LOOP, t0 - loop_start);
+        loop_start = t0;
         // 主循环抖动探针：放循环体最顶部，量的是"上一轮开头 → 本轮开头"的完整周期，
         // 循环里任何一处阻塞都会被记进 Loop0 的 max。见 loop_probe.h。
         loop_probe_tick(probe_core0, 0);
@@ -616,17 +623,27 @@ int main() {
 #endif
         cyw43_arch_poll();
         bt_connection_watchdog_tick();
+        const uint32_t t1 = perf_now();
+        perf_record(PERF_CYW43, t1 - t0);
         tud_task();
         xbox_usb_flush();
+        const uint32_t t2 = perf_now();
+        perf_record(PERF_TUD, t2 - t1);
         cmd_task();
         bt_initial_state_task();
         wake_task();
+        const uint32_t t2c = perf_now();
         if (!usb_xbox_mode) audio_loop();
 #if ENABLE_DEBUG
         debug_log_core1_stack_usage();
 #endif
+        const uint32_t t3 = perf_now();
+        perf_record(PERF_AUDIO, t3 - t2c);
         interrupt_loop();
+        const uint32_t t4 = perf_now();
         oled_loop();
+        const uint32_t t5 = perf_now();
+        perf_record(PERF_OLED, t5 - t4);
 #if ENABLE_BATT_LED
         battery_led_tick();
 #endif
@@ -639,5 +656,6 @@ int main() {
         //                   // 恢复：取消本行注释即可。
         bt_inquiring_led();
         dse_task();
+        perf_record(PERF_INPUT, (t2c - t2) + (t4 - t3) + (perf_now() - t5));
     }
 }

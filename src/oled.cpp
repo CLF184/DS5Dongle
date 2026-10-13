@@ -4,6 +4,7 @@
 #include "bt.h"
 #include "slots.h"
 #include "audio.h"
+#include "perf.h"
 #include "config.h"
 #include "utils.h"   // SetStateData（记录主机 0x02 的 LED 颜色）
 #include <cstddef>  // offsetof
@@ -1111,8 +1112,8 @@ __attribute__((noinline)) void render_screen_rssi() {
     flush_fb();
 }
 
-// Diagnostics screen state. Read-only viewport that scrolls with controller
-// D-pad up/down. No cursor — there's nothing to select.
+// Diagnostics viewport: D-pad scrolls, triangle resets the timing window.
+// No cursor — there's nothing to select.
 int   diag_scroll = 0;
 uint8_t diag_last_dpad = 8; // edge-trigger N/E/S/W like settings_handle_input
 // Rows on screen at once — used both for the render loop and for the scroll
@@ -1193,9 +1194,30 @@ void sample_diag_rates() {
 // Row list ordered by relevance: always-useful at top, parked-mic-investigation
 // data at bottom. To add a row, bump kNumDiagRows and add a case.
 //   0 Up   1 BT   2/3 Loop0/Loop1   4 host02   5 trig   6-9 速率  10-12 麦克风
-constexpr int kNumDiagRows = 21;
+constexpr int kNumDiagRows = 22 + PERF_NUM_STAGES;
+uint8_t diag_perf[kPerfReportBytes]{};
+uint8_t diag_last_face = 0;
 __attribute__((noinline))
 void format_diag_row(int idx, char* line, size_t n) {
+    if (idx >= 22 && idx < kNumDiagRows) {
+        static constexpr const char *names[] = {"Loop", "BT", "USB", "Aud", "Inp", "OLED", "Spk", "Mic"};
+        const int stage = idx - 22;
+        uint32_t avg_ns;
+        uint16_t max_us;
+        memcpy(&avg_ns, diag_perf + 4 + stage * 6, sizeof(avg_ns));
+        memcpy(&max_us, diag_perf + 8 + stage * 6, sizeof(max_us));
+        const uint32_t avg_us = (uint32_t)(((uint64_t)avg_ns + 500u) / 1000u);
+        if (avg_us >= 10000 || max_us >= 10000) {
+            const uint32_t avg_ms10 = avg_ns / 100000u;
+            const uint32_t max_ms10 = max_us / 100u;
+            snprintf(line, n, "%s:%lu.%lu/%lu.%lums", names[stage],
+                     (unsigned long)(avg_ms10 / 10), (unsigned long)(avg_ms10 % 10),
+                     (unsigned long)(max_ms10 / 10), (unsigned long)(max_ms10 % 10));
+        } else {
+            snprintf(line, n, "%s:%lu/%uus", names[stage], (unsigned long)avg_us, (unsigned)max_us);
+        }
+        return;
+    }
     switch (idx) {
         case 0: {
             const uint32_t s = (uint32_t)(time_us_64() / 1000000u);
@@ -1294,6 +1316,9 @@ void format_diag_row(int idx, char* line, size_t n) {
         case 20:
             snprintf(line, n, "C1 stage:%lu/9", (unsigned long)audio_c1_stage());
             break;
+        case 21:
+            snprintf(line, n, "Timing avg/max");
+            break;
         default:
             line[0] = '\0';
             break;
@@ -1302,6 +1327,9 @@ void format_diag_row(int idx, char* line, size_t n) {
 
 void diag_handle_input(int visible) {
     if (!bt_is_connected()) return;
+    const uint8_t face = interrupt_in_data[7] & 0xF0;
+    if ((face & ~diag_last_face) & 0x80) perf_reset(); // triangle: new timing window
+    diag_last_face = face;
     const uint8_t dpad = (uint8_t)(interrupt_in_data[7] & 0x0F);
     if (dpad != diag_last_dpad && dpad != 8) {
         if      (dpad == 0) diag_scroll--; // up
@@ -1330,11 +1358,13 @@ __attribute__((noinline)) void render_screen_diag() {
     if (force) {
         fb_clear();
         draw_text(kContentX, 0, "Diagnostics");
+        draw_text(kContentX, 56, "Tri:reset timings");
         for (int i = 0; i < kDiagVisible; i++) row_valid[i] = false;
         last_markers = 0xFF;
     }
 
     sample_diag_rates();
+    if (diag_scroll + kDiagVisible > 22) perf_serialize(diag_perf, sizeof(diag_perf));
     // Input is sampled by screen_input_tick() every loop iteration, not here.
 
     // 19 characters max (= 113 px, ends at x=118): keeps even the unbounded
@@ -2291,6 +2321,10 @@ void screen_input_tick() {
     // setting or switch a slot behind a blank panel. oled_power_state lags by
     // at most one frame, so a press that wakes the panel still registers — the
     // same one-frame latency the old render-path sampling had.
+    static bool was_diag = false;
+    const bool active_diag = oled_power_state == OLED_ACTIVE && current_screen == kScreenDiag && bt_is_connected();
+    if (active_diag && !was_diag) diag_last_face = interrupt_in_data[7] & 0xF0;
+    was_diag = active_diag;
     if (oled_power_state != OLED_ACTIVE) return;
     switch (current_screen) {
         case kScreenSlots:    slots_handle_input();            break;
