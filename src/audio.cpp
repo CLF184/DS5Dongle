@@ -8,6 +8,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+#include <malloc.h>
+#include <unistd.h>
 #include "audio.h"
 #include "bt.h"
 #if ENABLE_DEBUG
@@ -116,6 +118,19 @@ uint32_t opus_fifo_drops() { return g_drop_enc; }
 uint32_t audio_hap_drops() { return g_drop_hap; }
 uint32_t audio_c1_loops() { return g_c1_loops; }
 uint32_t audio_c1_enc() { return g_c1_enc; }
+
+extern "C" char __HeapLimit;
+static uint32_t free_heap_bytes() {
+    const struct mallinfo info = mallinfo();
+    const char *top = static_cast<const char *>(sbrk(0));
+    return static_cast<uint32_t>(info.fordblks) + static_cast<uint32_t>(&__HeapLimit - top);
+}
+static volatile uint32_t g_c1_flags = 0, g_c1_free_heap = 0;
+static volatile uint8_t g_c1_stage = 0;
+static volatile bool g_spk_ready = false;
+uint32_t audio_c1_flags() { return g_c1_flags; }
+uint32_t audio_c1_free_heap() { return g_c1_free_heap; }
+uint32_t audio_c1_stage() { return g_c1_stage; }
 uint32_t audio_raw_push() { return g_raw_push; }
 uint32_t audio_hap_push() { return g_hap_push; }
 
@@ -215,7 +230,7 @@ void __not_in_flash_func(audio_bt_task)() {
     const Config_body &cfg = get_config();
     const bool mic_enabled = mic_active && cfg.mic_select != 3;
 #if !DISABLE_SPEAKER_PROC
-    const bool speaker_enabled = cfg.speaker_select != 3;
+    const bool speaker_enabled = g_spk_ready && cfg.speaker_select != 3;
 #endif
 
     if (queue_get_level(&haptics_fifo) < 2) {
@@ -336,7 +351,7 @@ static void __not_in_flash_func(mic_drain)() {
 
 void __not_in_flash_func(audio_loop)() {
     const Config_body &cfg = get_config();
-    const bool speaker_enabled = cfg.speaker_select != 3;
+    const bool speaker_enabled = g_spk_ready && cfg.speaker_select != 3;
 
     mic_drain();
 
@@ -632,39 +647,46 @@ static bool __not_in_flash_func(mic_proc)() {
 }
 
 void __not_in_flash_func(core1_entry)() {
-    // Register core1 as a flash-safe victim so core0's flash_safe_execute() really
-    // parks this core while flash is accessed, instead of letting it fault on XIP.
-    // Used by config_save() (flash erase/program) and the BOOTSEL poll (which briefly
-    // floats QSPI CSn) - the latter makes polling BOOTSEL safe while audio streams on
-    // core1. Requires PICO_FLASH_ASSUME_CORE1_SAFE=0.
+    g_c1_stage = 1;
     flash_safe_execute_core_init();
-    
-    // Allow Core 0 to fully initialize Bluetooth and USB stacks before Core 1 starts processing
-    // otherwise the dongle could shut down at initialization
-    // TODO: Search for initialization callbacks of core 0
+    g_c1_stage = 2;
+    g_c1_flags |= 0x01;
+    // Preserve this port's Bluetooth/USB startup delay.
     sleep_ms(300);
-
+    g_c1_stage = 3; // startup delay complete; this port has no perf cycle counter
+    g_c1_free_heap = free_heap_bytes();
     int error = 0;
 #if !DISABLE_SPEAKER_PROC
-    encoder = opus_encoder_create(48000, 2,OPUS_APPLICATION_AUDIO, &error);
-    if (error != 0) {
-        printf("[Audio] OpusEncoder create failed\n");
-        return;
+    g_c1_stage = 4;
+    encoder = opus_encoder_create(48000, 2, OPUS_APPLICATION_AUDIO, &error);
+    g_c1_stage = 5;
+    if (error != 0 || encoder == nullptr) {
+        printf("[Audio] OpusEncoder create failed (err=%d): speaker off\n", error);
+        encoder = nullptr;
+        g_c1_flags |= 0x02;
+    } else {
+        opus_encoder_ctl(encoder, OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
+        opus_encoder_ctl(encoder, OPUS_SET_BITRATE(200 * 8 * 100));
+        opus_encoder_ctl(encoder, OPUS_SET_VBR(false));
+        opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
+        resampler_audio.SetMode(true, 0, false);
+        resampler_audio.SetRates(51200, 48000);
+        resampler_audio.SetFeedMode(true);
+        resampler_audio.Prealloc(2, 512, 480);
+        g_spk_ready = true;
     }
-    opus_encoder_ctl(encoder,OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_10_MS));
-    opus_encoder_ctl(encoder,OPUS_SET_BITRATE(200 * 8 * 100));
-    opus_encoder_ctl(encoder,OPUS_SET_VBR(false));
-    opus_encoder_ctl(encoder,OPUS_SET_COMPLEXITY(0)); // max 4
-    resampler_audio.SetMode(true, 0, false);
-    resampler_audio.SetRates(51200, 48000);
-    resampler_audio.SetFeedMode(true);
-    resampler_audio.Prealloc(2, 512, 480);
+    g_c1_stage = 6;
 #endif
+    g_c1_stage = 7;
     mic_decoder = opus_decoder_create(48000, MIC_CHANNELS, &error);
-    if (error != 0) {
+    g_c1_stage = 8;
+    if (error != 0 || mic_decoder == nullptr) {
         printf("[Audio] OpusDecoder create failed\n");
         mic_decoder = nullptr;
+        g_c1_flags |= 0x04;
     }
+    // A stopped core1 cannot participate in flash lockout: always keep looping.
+    g_c1_stage = 9;
 
     static LoopProbe probe_core1;
 
@@ -681,7 +703,7 @@ void __not_in_flash_func(core1_entry)() {
         // This avoids constantly acquiring queue locks (spinlocks) when idle,
         // which would otherwise thrash the RP2350 system bus and starve Core 0.
 #if !DISABLE_SPEAKER_PROC
-        if (encoder != nullptr && queue_get_level(&audio_fifo) > 0) {
+        if (g_spk_ready && queue_get_level(&audio_fifo) > 0) {
             speaker_proc();
             work_done = true;
         }

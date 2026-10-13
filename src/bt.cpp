@@ -66,6 +66,7 @@ static void l2cap_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t 
 static btstack_packet_callback_registration_t hci_event_callback_registration, l2cap_event_callback_registration;
 static bd_addr_t current_device_addr;
 static bool device_found = false;
+static bool controller_model_known = false;
 static bool new_pair = false; // 只有新匹配的设备才用创建channel，自动重连走的是service
 bool bt_inquiring = false;
 
@@ -704,6 +705,7 @@ static void __not_in_flash_func(hci_packet_handler)(uint8_t packet_type, uint16_
         case HCI_EVENT_DISCONNECTION_COMPLETE: {
             initial_state_pending = false;
             audio_on_bt_disconnected();
+            controller_model_known = false;
             bt_clear_host_rumble();
             cmd_on_bt_disconnected();
 #if !ENABLE_SERIAL
@@ -801,6 +803,7 @@ static void __not_in_flash_func(l2cap_packet_handler)(uint8_t packet_type, uint1
                 printf("[L2CAP] Stored Feature Report 0x%02X, len=%u\n", report_id, size - 2);
 #endif
                 if (report_id == 0x20) {
+                    controller_model_known = true;
                     if (packet[23] == 0x44) {
                         printf("Connected DSE Controller\n");
                         is_dse = true;
@@ -1091,7 +1094,10 @@ void set_feature_data(uint8_t reportId, uint8_t *data, uint16_t len) {
     }
 }
 
+bool bt_controller_model_known() { return controller_model_known && bt_is_connected(); }
+
 void init_feature() {
+    controller_model_known = false;
     feature_data.clear();
     get_feature_data(0x09, 20);
     get_feature_data(0x20, 64);

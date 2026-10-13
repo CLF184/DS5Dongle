@@ -1,5 +1,6 @@
 #include "oled.h"
 #include "oled_font.h"
+#include "oled_pad.h"
 #include "bt.h"
 #include "slots.h"
 #include "audio.h"
@@ -576,15 +577,6 @@ static const uint8_t kIconLinkOff[8] = {
     0b00111100,
 };
 
-// Battery icon — body 52x8 + small nub on the right. Inside fill scales with pct.
-void draw_battery_icon(int x, int y, int pct) {
-    rect_outline(x, y, 52, 8);
-    rect_filled(x + 52, y + 2, 3, 4);
-    int fill = (pct * 48) / 100;
-    if (fill < 0) fill = 0;
-    if (fill > 48) fill = 48;
-    if (fill > 0) rect_filled(x + 2, y + 2, fill, 4);
-}
 
 void send_rumble(uint8_t amplitude) {
     uint8_t pkt[78] = {};
@@ -917,6 +909,18 @@ void sample_charge_eta() {
 //   4 按键    x=42..91, y=30..56        十字键 + 面键 + L1/R1
 // 签名没变 → 整块跳过，面板继续显示上一帧（SH1107 自带显存）。
 // fb 代次变了（切屏 / 从 dim 回来 / 上电）→ fb_clear() + 全部重画。
+struct FbCanvas {
+    void px(int x, int y, bool on) { ::px(x, y, on); }
+    void outline(int x, int y, int w, int h) { rect_outline(x, y, w, h); }
+    void filled(int x, int y, int w, int h) { rect_filled(x, y, w, h); }
+    void invert(int x, int y, int w, int h) { rect_invert(x, y, w, h); }
+};
+
+__attribute__((noinline)) void render_status_buttons(bool edge) {
+    FbCanvas canvas;
+    oled_pad::draw_buttons(canvas, interrupt_in_data, edge);
+}
+
 __attribute__((noinline)) void render_screen() {
     const bool connected = bt_is_connected();
 
@@ -949,8 +953,10 @@ __attribute__((noinline)) void render_screen() {
     h_info = sig_mix(h_info, (uint32_t)(ce.charging | (ce.valid << 1) | (ce.provisional << 2)));
     h_info = sig_mix(h_info, (uint32_t)ce.minutes);
     const uint32_t h_bar = sig_mix(sig_mix(2166136261u, interrupt_in_data[4]), interrupt_in_data[5]);
-    const uint32_t h_btn = sig_mix(sig_mix(2166136261u, interrupt_in_data[7]),
-                                   interrupt_in_data[8] & 0x03);
+    const bool edge = is_dse && bt_controller_model_known();
+    uint32_t h_btn = sig_mix(sig_mix(2166136261u, interrupt_in_data[7]), interrupt_in_data[8] & 0x33);
+    h_btn = sig_mix(h_btn, edge);
+    h_btn = sig_mix(h_btn, edge ? interrupt_in_data[9] & 0xf0 : 0);
 
     // ---- 区域 0：顶栏 ----
     if (force || h_top != sig_last[0]) {
@@ -998,13 +1004,14 @@ __attribute__((noinline)) void render_screen() {
         char bbuf[16];
         snprintf(bbuf, sizeof(bbuf), "%3d%%%c", pct, marker);
         draw_text(kContentX, 18, bbuf);
-        draw_battery_icon(36, 18, pct);
+        FbCanvas canvas;
+        oled_pad::battery(canvas, pct);
 
-        // Charge ETA, right of the battery icon (icon + nub end at x=90). Shown
+        // Charge ETA, mirrored to the right of the battery (nub ends at x=91). Shown
         // only while charging: "~43m?" is the provisional default-rate estimate
         // shown immediately on plug-in; the "?" drops to "~43m" once a real 10%
         // step has been timed and the measured rate takes over. See
-        // sample_charge_eta(). x=92 (not 94) so a 3-digit "~145m?" stays on panel.
+        // sample_charge_eta(). The upstream geometry places it at x=93.
         if (ce.charging) {
             char ebuf[8];
             if (ce.valid)
@@ -1012,7 +1019,7 @@ __attribute__((noinline)) void render_screen() {
                          ce.provisional ? "?" : "");
             else
                 snprintf(ebuf, sizeof(ebuf), "~--m");
-            draw_text(92, 18, ebuf);
+            draw_text(oled_pad::kEtaX, oled_pad::kBattY, ebuf);
         }
     }
 
@@ -1022,9 +1029,9 @@ __attribute__((noinline)) void render_screen() {
         for (int i = 0; i < 2; i++) {
             // Left-half visuals are shifted right by kContentX so the < button
             // chrome at (x=0, y=49) doesn't paint over the live stick dot.
-            const int  bx  = i ? 96 : kContentX;
-            const int  lx  = (bx + 2) + (interrupt_in_data[i * 2] * 27) / 255;
-            const int  ly  = 32 + (interrupt_in_data[i * 2 + 1] * 27) / 255;
+            const int bx = i ? oled_pad::mirror_left(oled_pad::kLeft, oled_pad::kBox) : oled_pad::kLeft;
+            const int lx = bx + 3 + oled_pad::stick_offset(interrupt_in_data[i * 2]);
+            const int ly = oled_pad::kTop + 3 + oled_pad::stick_offset(interrupt_in_data[i * 2 + 1]);
             // L3 / R3 (stick click) — invert the whole box as a pressed indicator.
             const bool inv = i ? (b8 & 0x80) : (b8 & 0x40);
             Stick &st = stick[i];
@@ -1033,10 +1040,10 @@ __attribute__((noinline)) void render_screen() {
             // —— 整框反色期间一律整框重画。点先画、后反色，和原实现同序，
             // 所以按下时点也会跟着反色。
             if (force || !st.valid || st.inv != inv || inv) {
-                rect_clear(bx, 30, 32, 32);
-                rect_outline(bx, 30, 32, 32);
+                rect_clear(bx, oled_pad::kTop, oled_pad::kBox, oled_pad::kBox);
+                rect_outline(bx, oled_pad::kTop, oled_pad::kBox, oled_pad::kBox);
                 rect_filled(lx - 1, ly - 1, 3, 3);
-                if (inv) rect_invert(bx, 30, 32, 32);
+                if (inv) rect_invert(bx, oled_pad::kTop, oled_pad::kBox, oled_pad::kBox);
                 st.inv = inv;
                 st.valid = true;
             } else if (st.x != lx || st.y != ly) {
@@ -1051,60 +1058,21 @@ __attribute__((noinline)) void render_screen() {
         }
     }
 
-    // ---- 区域 3：L2/R2 模拟量条（垂直，从底部填充）----
+    // Keep the existing region cache, using the final symmetric geometry.
     if (force || h_bar != sig_last[2]) {
         sig_last[2] = h_bar;
-        rect_clear(kContentX + 32, 33, 4, 29);
-        rect_outline(kContentX + 32, 33, 4, 29);
-        const int l2_fill = (interrupt_in_data[4] * 27) / 255;
-        if (l2_fill > 0) rect_filled(kContentX + 33, 61 - l2_fill, 2, l2_fill);
-        rect_clear(92, 33, 4, 29);
-        rect_outline(92, 33, 4, 29);
-        const int r2_fill = (interrupt_in_data[5] * 27) / 255;
-        if (r2_fill > 0) rect_filled(93, 61 - r2_fill, 2, r2_fill);
+        const int left = oled_pad::kTrigX;
+        const int right = oled_pad::mirror_left(left, oled_pad::kTrigW);
+        rect_clear(left, oled_pad::kTop, oled_pad::kTrigW, oled_pad::kBox);
+        rect_clear(right, oled_pad::kTop, oled_pad::kTrigW, oled_pad::kBox);
+        FbCanvas canvas;
+        oled_pad::trigger(canvas, left, interrupt_in_data[4]);
+        oled_pad::trigger(canvas, right, interrupt_in_data[5]);
     }
-
-    // ---- 区域 4：十字键 + 面键 + L1/R1 ----
     if (force || h_btn != sig_last[3]) {
         sig_last[3] = h_btn;
-        rect_clear(42, 30, 50, 27);     // x=42..91, y=30..56（把这一整块擦干净再画）
-        const uint8_t b7 = interrupt_in_data[7];
-        const uint8_t b8 = interrupt_in_data[8];
-
-        // D-pad indicator (4 directions; lit for primary + diagonals).
-        // Centered between the left stick column and the face-button cluster.
-        const int dp = b7 & 0x0F;
-        const bool dp_n = (dp == 7 || dp == 0 || dp == 1);
-        const bool dp_e = (dp == 1 || dp == 2 || dp == 3);
-        const bool dp_s = (dp == 3 || dp == 4 || dp == 5);
-        const bool dp_w = (dp == 5 || dp == 6 || dp == 7);
-        const int dcx = 52, dcy = 46;
-        auto dot = [&](int dx, int dy, bool on) {
-            if (on) rect_filled(dcx + dx - 2, dcy + dy - 2, 5, 5);
-            else    rect_outline(dcx + dx - 2, dcy + dy - 2, 5, 5);
-        };
-        dot(0,  -7, dp_n);
-        dot(7,   0, dp_e);
-        dot(0,   7, dp_s);
-        dot(-7,  0, dp_w);
-
-        const int fcx = 64, fcy = 46;
-        auto sq = [&](int dx, int dy, bool on) {
-            if (on) rect_filled(fcx + dx - 2, fcy + dy - 2, 5, 5);
-            else    rect_outline(fcx + dx - 2, fcy + dy - 2, 5, 5);
-        };
-        // Shift face buttons right so they don't collide with the d-pad — but
-        // only by 16: at 18 the ○ square's right column (x=92) merged with the
-        // R2 bar's left outline (also x=92).
-        const int fcx_off = 16;
-        sq(fcx_off + 0,  -8, b7 & 0x80); // Triangle
-        sq(fcx_off + 8,   0, b7 & 0x40); // Circle
-        sq(fcx_off + 0,   8, b7 & 0x20); // Cross
-        sq(fcx_off - 8,   0, b7 & 0x10); // Square
-
-        // L1 bar shifted to sit between the L2 trigger column and the d-pad.
-        if (b8 & 0x01) rect_filled(42, 30, 8, 3);  else rect_outline(42, 30, 8, 3);  // L1
-        if (b8 & 0x02) rect_filled(80, 30, 12, 3); else rect_outline(80, 30, 12, 3); // R1
+        rect_clear(oled_pad::kShoulderX, oled_pad::kTop, kW - 2 * oled_pad::kShoulderX, oled_pad::kBox);
+        render_status_buttons(edge);
     }
 
     flush_fb();
@@ -1225,7 +1193,7 @@ void sample_diag_rates() {
 // Row list ordered by relevance: always-useful at top, parked-mic-investigation
 // data at bottom. To add a row, bump kNumDiagRows and add a case.
 //   0 Up   1 BT   2/3 Loop0/Loop1   4 host02   5 trig   6-9 速率  10-12 麦克风
-constexpr int kNumDiagRows = 18;
+constexpr int kNumDiagRows = 21;
 __attribute__((noinline))
 void format_diag_row(int idx, char* line, size_t n) {
     switch (idx) {
@@ -1314,6 +1282,18 @@ void format_diag_row(int idx, char* line, size_t n) {
             snprintf(line, n, "Flash %lu fail %lu", (unsigned long)g_fse_calls, (unsigned long)g_fse_fail);
             break;
         }
+        case 18: {
+            const uint32_t flags = audio_c1_flags();
+            snprintf(line, n, "C1:%s S:%s M:%s", flags & 1 ? "on" : "off",
+                     flags & 2 ? "ERR" : "ok", flags & 4 ? "ERR" : "ok");
+            break;
+        }
+        case 19:
+            snprintf(line, n, "C1 heap:%luK", (unsigned long)(audio_c1_free_heap() / 1024));
+            break;
+        case 20:
+            snprintf(line, n, "C1 stage:%lu/9", (unsigned long)audio_c1_stage());
+            break;
         default:
             line[0] = '\0';
             break;

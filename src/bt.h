@@ -23,6 +23,7 @@ void bt_send_packet(uint8_t *data, uint16_t len);
 void bt_send_control(uint8_t *data, uint16_t len);
 bool bt_disconnect();
 bool bt_is_connected();
+bool bt_controller_model_known();
 void bt_set_scan_idle();
 void bt_set_scan_active();
 void dse_unlock_task();

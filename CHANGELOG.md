@@ -1,5 +1,18 @@
 # 更新记录
 
+## v0.8.8
+
+- 移植 OLED 上游的 core1 初始化容错：扬声器编码器初始化失败后继续运行麦克风、
+  触觉和闪存安全停放路径，不再退出 core1 或等待缺失的扬声器帧。
+- 新增 core1 启动标志、失败状态、启动阶段和启动剩余堆内存；`0xF5` 采用最终
+  63 字节布局，OLED Diag 增加对应读数。
+- OLED 状态页采用对称布局、圆角面键和满倾斜留边，增加 Create / Options 与
+  DualSense Edge 的 Fn L / Fn R / LB / RB 显示，更新电池与充电时间排版。
+- 同步上游 Opus 编译选项，关闭 `OPUS_HARDENING`、`OPUS_STACK_PROTECTOR`
+  和 `OPUS_FORTIFY_SOURCE`。
+- Pico SDK 2.3.0 / ARM GCC 13.2.Rel1 的标准、Wake-HID、Waveshare、无扬声器
+  四种构建通过，音频驻 RAM 检查通过。
+
 ## v0.8.7
 
 - OLED Settings 从启用麦克风切换到 `MicSel=Off` 并按三角应用/保存时，立即发送

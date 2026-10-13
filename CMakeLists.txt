@@ -147,6 +147,10 @@ target_include_directories(wdl_resampler PUBLIC
 
 # Opus
 #set(OPUS_FIXED_POINT ON)
+# Match OLED upstream's embedded Opus options before its CMake reads them.
+set(OPUS_HARDENING OFF CACHE BOOL "libopus runtime hardening checks" FORCE)
+set(OPUS_STACK_PROTECTOR OFF CACHE BOOL "libopus stack protection" FORCE)
+set(OPUS_FORTIFY_SOURCE OFF CACHE BOOL "libopus _FORTIFY_SOURCE" FORCE)
 add_subdirectory(lib/opus)
 
 # Phase A.3: Move libopus to RAM via .time_critical sections.

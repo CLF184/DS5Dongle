@@ -120,8 +120,17 @@ uint16_t pico_cmd_get(uint8_t report_id, uint8_t *buffer, uint16_t reqlen) {
             audio_raw_push(), audio_hap_push(), audio_mic_frames(), audio_mic_plc_frames(),
             g_fse_calls, g_fse_fail, g_setfeat_count, g_setfeat_last,
         };
-        const uint16_t len = std::min<size_t>(reqlen, sizeof(words));
-        memcpy(buffer, words, len);
+        static_assert(sizeof(words) == 60, "Keep the existing diagnostic prefix");
+        uint8_t out[63];
+        memcpy(out, words, sizeof(words));
+        uint32_t kib = audio_c1_free_heap() / 1024;
+        if (kib == 0 && audio_c1_free_heap() > 0) kib = 1;
+        if (kib > 0xffff) kib = 0xffff;
+        out[60] = static_cast<uint8_t>((audio_c1_flags() & 7) | ((audio_c1_stage() & 15) << 3) | 0x80);
+        out[61] = static_cast<uint8_t>(kib);
+        out[62] = static_cast<uint8_t>(kib >> 8);
+        const uint16_t len = std::min<size_t>(reqlen, sizeof(out));
+        memcpy(buffer, out, len);
         return len;
     }
     if (report_id == 0xf7) {
