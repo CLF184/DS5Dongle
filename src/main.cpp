@@ -31,6 +31,7 @@
 #include "config.h"
 #include "cmd.h"
 #include "dse.h"
+#include "fake_ds5.h"
 #include "status_gpio.h"
 #if ENABLE_BATT_LED
 #include "battery_led.h"
@@ -306,8 +307,9 @@ uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t
     // size + crc, but the GAME validates the actual CONTENT — so synthesized zeros
     // pass the kernel yet get rejected by the game (a ~156x GET retry storm, and no
     // native adaptive triggers). Serve the REAL controller data, which init_feature()
-    // caches from the controller over BT (get_feature_data returns it incl. the
-    // report-id at [0]). Fall back to a crc-valid synthetic answer ONLY when the
+    // caches from the controller over BT (report data without the report ID).
+    // An Edge exposed as a DualSense gets the pinned DS5 0x20 at reply time.
+    // Fall back to a crc-valid synthetic answer ONLY when the
     // controller isn't linked yet (USB-enumeration probe before the BT link), so the
     // kernel still binds at that moment.
     if (report_id == 0x09 || report_id == 0x20 || report_id == 0x05) {
@@ -317,9 +319,16 @@ uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t
         // 主机侧 usbhid/WebHID 会自己把 report id 补在返回缓冲区第 0 字节，所以
         // 这里原样整段拷贝即可——旧 fork 约定（向量第 0 字节是 ID）才需要 +1。
         if (!real.empty()) {                       // real cached response present
+            const uint8_t *src = real.data();
             uint16_t n = (uint16_t) real.size();
+            // Keep the Edge's real cache. Only an Edge exposed as a DualSense
+            // gets the pinned DS5 firmware report, without a report-id byte.
+            if (report_id == 0x20 && is_dse && ds_mode()) {
+                src = report20;
+                n = sizeof(report20);
+            }
             if (n > reqlen) n = reqlen;
-            memcpy(buffer, real.data(), n);
+            memcpy(buffer, src, n);
             return n;
         }
         memset(buffer, 0, reqlen);

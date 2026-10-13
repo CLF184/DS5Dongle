@@ -2,6 +2,9 @@
 
 ## 未发布
 
+- 保留 DualSense Edge 的真实固件信息缓存；只有在 DS5 模式回复电脑读取 `0x20`
+  时提供普通 DualSense 固件信息，Auto / DSE 模式返回真实数据。连接时最后读取
+  `0x20`，让配对和校准报告先到达，再识别手柄并连接 USB。
 - 扬声器默认使用 CELT-only 编码，省去未使用的 SILK 状态和预读缓冲；编译时设置
   `OPUS_ENCODER_CELT_ONLY=OFF` 可回到原来的 AUDIO 编码器。
 - 新增主循环、蓝牙、USB、音频、输入/命令、OLED、core1 扬声器和麦克风的平均/最大耗时。

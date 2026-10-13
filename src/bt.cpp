@@ -22,7 +22,6 @@
 #include "config.h"
 #include "status_gpio.h"
 #include "dse.h"
-#include "fake_ds5.h"
 #include "wake.h"
 #include "usb.h"
 #include "xbox_usb.h"
@@ -802,7 +801,7 @@ static void __not_in_flash_func(l2cap_packet_handler)(uint8_t packet_type, uint1
 #if ENABLE_VERBOSE
                 printf("[L2CAP] Stored Feature Report 0x%02X, len=%u\n", report_id, size - 2);
 #endif
-                if (report_id == 0x20) {
+                if (report_id == 0x20 && size > 23) {
                     controller_model_known = true;
                     if (packet[23] == 0x44) {
                         printf("Connected DSE Controller\n");
@@ -810,10 +809,6 @@ static void __not_in_flash_func(l2cap_packet_handler)(uint8_t packet_type, uint1
                         connect_attempt_started = 0; // fully up — disarm watchdog
                         // 解锁 Edge 档位；USB 先连上，档位读取由 dse_profiles_ready() 门控
                         dse_on_connect();
-                        // 上游 ae83907：DSE 在"DS5 模式"下对主机伪装成 DS5 固件信息
-                        if (get_config().controller_mode == 0) {
-                            feature_data[0x20].assign(report20,report20 + sizeof(report20));
-                        }
                     } else {
                         printf("Connected DS5 Controller\n");
                         is_dse = false;
@@ -1100,9 +1095,10 @@ void init_feature() {
     controller_model_known = false;
     feature_data.clear();
     get_feature_data(0x09, 20);
-    get_feature_data(0x20, 64);
     get_feature_data(0x22, 64);
     get_feature_data(0x05, 41);
+    // Its reply identifies the controller and connects USB, after the reports above.
+    get_feature_data(0x20, 64);
 }
 
 uint8_t bt_scale_rumble(uint8_t value, float gain) {
