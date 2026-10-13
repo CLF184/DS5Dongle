@@ -1135,6 +1135,9 @@ struct DiagRates {
     uint32_t bt_rate;
     uint32_t mic_rate;
     uint32_t bt31_rate;
+    uint32_t enc_rate;
+    uint32_t raw_rate;
+    uint32_t hap_rate;
 };
 DiagRates g_diag_rates{};
 
@@ -1148,6 +1151,7 @@ constexpr uint32_t kRatePrimeUs  =  200000u; // first window after entering the 
 
 void sample_diag_rates() {
     static uint32_t base_us_frames = 0, base_bt_packets = 0, base_mic_frames = 0, base_bt31 = 0;
+    static uint32_t base_enc = 0, base_raw = 0, base_hap = 0;
     static uint32_t win_start_us = 0;
     static bool     have_value   = false;
     const uint32_t now_us = time_us_32();
@@ -1158,6 +1162,9 @@ void sample_diag_rates() {
         base_bt_packets = audio_bt_packets();
         base_mic_frames = audio_mic_frames();
         base_bt31       = bt_31_packet_count();
+        base_enc        = audio_c1_enc();
+        base_raw        = audio_raw_push();
+        base_hap        = audio_hap_push();
         return;
     }
 
@@ -1171,6 +1178,9 @@ void sample_diag_rates() {
     const uint32_t cur_bt_packets = audio_bt_packets();
     const uint32_t cur_mic_frames = audio_mic_frames();
     const uint32_t cur_bt31       = bt_31_packet_count();
+    const uint32_t cur_enc        = audio_c1_enc();
+    const uint32_t cur_raw        = audio_raw_push();
+    const uint32_t cur_hap        = audio_hap_push();
 
     if (stale) {
         // Keep the last shown values; just restart the window from here.
@@ -1180,6 +1190,9 @@ void sample_diag_rates() {
         g_diag_rates.bt_rate   = (uint32_t)(((uint64_t)(cur_bt_packets - base_bt_packets) * 1000000u) / dt_us);
         g_diag_rates.mic_rate  = (uint32_t)(((uint64_t)(cur_mic_frames - base_mic_frames) * 1000000u) / dt_us);
         g_diag_rates.bt31_rate = (uint32_t)(((uint64_t)(cur_bt31       - base_bt31)       * 1000000u) / dt_us);
+        g_diag_rates.enc_rate  = (uint32_t)(((uint64_t)(cur_enc - base_enc) * 1000000u) / dt_us);
+        g_diag_rates.raw_rate  = (uint32_t)(((uint64_t)(cur_raw - base_raw) * 1000000u) / dt_us);
+        g_diag_rates.hap_rate  = (uint32_t)(((uint64_t)(cur_hap - base_hap) * 1000000u) / dt_us);
         have_value = true;
     }
 
@@ -1188,20 +1201,23 @@ void sample_diag_rates() {
     base_bt_packets = cur_bt_packets;
     base_mic_frames = cur_mic_frames;
     base_bt31       = cur_bt31;
+    base_enc        = cur_enc;
+    base_raw        = cur_raw;
+    base_hap        = cur_hap;
     win_start_us    = now_us;
 }
 
 // Row list ordered by relevance: always-useful at top, parked-mic-investigation
 // data at bottom. To add a row, bump kNumDiagRows and add a case.
-//   0 Up   1 BT   2/3 Loop0/Loop1   4 host02   5 trig   6-9 速率  10-12 麦克风
-constexpr int kNumDiagRows = 21 + PERF_NUM_STAGES;
+// 0 Up, 1 BT, 2..18 diagnostics, 19/20 Loop0/Loop1, 21..27 stage timings.
+constexpr int kNumDiagRows = 20 + PERF_NUM_STAGES;
 uint8_t diag_perf[kPerfReportBytes]{};
 uint8_t diag_last_face = 0;
 __attribute__((noinline))
 void format_diag_row(int idx, char* line, size_t n) {
     if (idx >= 21 && idx < kNumDiagRows) {
-        static constexpr const char *names[] = {"Loop", "BT", "USB", "Aud", "Inp", "OLED", "Spk", "Mic"};
-        const int stage = idx - 21;
+        static constexpr const char *names[] = {"BT", "USB", "Aud", "Inp", "OLED", "Spk", "Mic"};
+        const int stage = idx - 20; // skip PERF_LOOP; Loop0/Loop1 are shown above
         uint32_t avg_ns;
         uint16_t max_us;
         memcpy(&avg_ns, diag_perf + 4 + stage * 6, sizeof(avg_ns));
@@ -1210,11 +1226,11 @@ void format_diag_row(int idx, char* line, size_t n) {
         if (avg_us >= 10000 || max_us >= 10000) {
             const uint32_t avg_ms10 = avg_ns / 100000u;
             const uint32_t max_ms10 = max_us / 100u;
-            snprintf(line, n, "%s:%lu.%lu/%lu.%lums", names[stage],
+            snprintf(line, n, "%s:%lu.%lu/%lu.%lums", names[stage - 1],
                      (unsigned long)(avg_ms10 / 10), (unsigned long)(avg_ms10 % 10),
                      (unsigned long)(max_ms10 / 10), (unsigned long)(max_ms10 % 10));
         } else {
-            snprintf(line, n, "%s:%lu/%uus", names[stage], (unsigned long)avg_us, (unsigned)max_us);
+            snprintf(line, n, "%s:%lu/%uus", names[stage - 1], (unsigned long)avg_us, (unsigned)max_us);
         }
         return;
     }
@@ -1230,15 +1246,15 @@ void format_diag_row(int idx, char* line, size_t n) {
         case 1:
             snprintf(line, n, "BT: %s", bt_is_connected() ? "connected" : "waiting");
             break;
-        case 2:
-        case 3: {
+        case 19:
+        case 20: {
             // 主循环抖动（loop_probe.h）：最近一个 1 s 窗口内的最大轮间隔 + 循环频率。
             // Loop0 = core0 转发主循环（USB/BT/OLED/灯条），Loop1 = core1 音频自旋环。
             // "Loop0 41k/s 2100us" = 那 1 s 里最坏的一轮卡了 2.1 ms。
             // 参考值：正常空闲档 max 是个位数~几十 µs；OLED 刷屏那一拍约 1 ms；
             // config_save 的 flash 擦写、CPU 屏进屏时的频率计忙等会有几十 ms 尖峰。
             // core1 有音频时天然是"一轮一次 opus 编/解码"，最大值本来就大。
-            const int      core   = idx - 2;
+            const int      core   = idx - 19;
             const uint32_t max_us = g_loop_max_us[core];
             const uint32_t hz     = g_loop_hz[core];
             char rate[10];
@@ -1250,35 +1266,35 @@ void format_diag_row(int idx, char* line, size_t n) {
                 snprintf(line, n, "Loop%d %s %luus", core, rate, (unsigned long)max_us);
             break;
         }
-        case 4:
+        case 2:
             snprintf(line, n, "host02: %lu", (unsigned long)host_out02_total());
             break;
-        case 5:
+        case 3:
             snprintf(line, n, "trig %lu / tx %lu",
                      (unsigned long)host_out02_trig_allow(),
                      (unsigned long)host_out02_to_bt());
             break;
-        case 6:
+        case 4:
             snprintf(line, n, "BT31 in: %lu/s", (unsigned long)g_diag_rates.bt31_rate);
             break;
-        case 7:
+        case 5:
             snprintf(line, n, "USB aud: %lu/s", (unsigned long)g_diag_rates.usb_rate);
             break;
-        case 8:
+        case 6:
             snprintf(line, n, "BT32 out: %lu/s", (unsigned long)g_diag_rates.bt_rate);
             break;
-        case 9:
+        case 7:
             snprintf(line, n, "Mic in: %lu/s", (unsigned long)g_diag_rates.mic_rate);
             break;
-        case 10:
+        case 8:
             snprintf(line, n, "Mic dec=%ld w=%u",
                      (long)audio_mic_last_decoded(),
                      (unsigned)audio_mic_last_wrote());
             break;
-        case 11:
+        case 9:
             snprintf(line, n, "Mic fail: %lu", (unsigned long)audio_mic_decode_failures());
             break;
-        case 12: {
+        case 10: {
             // Auto-haptics real usage: peak of the derived waveform (0-127).
             // Reads 0 while Fallback yields to native haptics or audio is silent.
             // Any non-zero output counts as active.
@@ -1287,33 +1303,33 @@ void format_diag_row(int idx, char* line, size_t n) {
             snprintf(line, n, "AH: %u%% %s", pct, (p > 0) ? "ACT" : "idle");
             break;
         }
-        case 13:
+        case 11:
             snprintf(line, n, "Drop %lu/%lu/%lu", (unsigned long)audio_fifo_drops(),
                      (unsigned long)opus_fifo_drops(), (unsigned long)audio_hap_drops());
             break;
-        case 14:
+        case 12:
             snprintf(line, n, "PLC: %lu", (unsigned long)audio_mic_plc_frames());
             break;
-        case 15:
-            snprintf(line, n, "c1 %lu enc %lu", (unsigned long)audio_c1_loops(), (unsigned long)audio_c1_enc());
+        case 13:
+            snprintf(line, n, "enc: %lu/s", (unsigned long)g_diag_rates.enc_rate);
             break;
-        case 16:
-            snprintf(line, n, "raw/hap %lu/%lu", (unsigned long)audio_raw_push(), (unsigned long)audio_hap_push());
+        case 14:
+            snprintf(line, n, "raw %lu/s hap %lu/s", (unsigned long)g_diag_rates.raw_rate, (unsigned long)g_diag_rates.hap_rate);
             break;
-        case 17: {
+        case 15: {
             snprintf(line, n, "Flash %lu fail %lu", (unsigned long)g_fse_calls, (unsigned long)g_fse_fail);
             break;
         }
-        case 18: {
+        case 16: {
             const uint32_t flags = audio_c1_flags();
             snprintf(line, n, "C1:%s S:%s M:%s", flags & 1 ? "on" : "off",
                      flags & 2 ? "ERR" : "ok", flags & 4 ? "ERR" : "ok");
             break;
         }
-        case 19:
+        case 17:
             snprintf(line, n, "C1 heap:%luK", (unsigned long)(audio_c1_free_heap() / 1024));
             break;
-        case 20:
+        case 18:
             snprintf(line, n, "C1 stage:%lu/9", (unsigned long)audio_c1_stage());
             break;
         default:
