@@ -1194,14 +1194,14 @@ void sample_diag_rates() {
 // Row list ordered by relevance: always-useful at top, parked-mic-investigation
 // data at bottom. To add a row, bump kNumDiagRows and add a case.
 //   0 Up   1 BT   2/3 Loop0/Loop1   4 host02   5 trig   6-9 速率  10-12 麦克风
-constexpr int kNumDiagRows = 22 + PERF_NUM_STAGES;
+constexpr int kNumDiagRows = 21 + PERF_NUM_STAGES;
 uint8_t diag_perf[kPerfReportBytes]{};
 uint8_t diag_last_face = 0;
 __attribute__((noinline))
 void format_diag_row(int idx, char* line, size_t n) {
-    if (idx >= 22 && idx < kNumDiagRows) {
+    if (idx >= 21 && idx < kNumDiagRows) {
         static constexpr const char *names[] = {"Loop", "BT", "USB", "Aud", "Inp", "OLED", "Spk", "Mic"};
-        const int stage = idx - 22;
+        const int stage = idx - 21;
         uint32_t avg_ns;
         uint16_t max_us;
         memcpy(&avg_ns, diag_perf + 4 + stage * 6, sizeof(avg_ns));
@@ -1316,9 +1316,6 @@ void format_diag_row(int idx, char* line, size_t n) {
         case 20:
             snprintf(line, n, "C1 stage:%lu/9", (unsigned long)audio_c1_stage());
             break;
-        case 21:
-            snprintf(line, n, "Timing avg/max");
-            break;
         default:
             line[0] = '\0';
             break;
@@ -1358,13 +1355,12 @@ __attribute__((noinline)) void render_screen_diag() {
     if (force) {
         fb_clear();
         draw_text(kContentX, 0, "Diagnostics");
-        draw_text(kContentX, 56, "Tri:reset timings");
         for (int i = 0; i < kDiagVisible; i++) row_valid[i] = false;
         last_markers = 0xFF;
     }
 
     sample_diag_rates();
-    if (diag_scroll + kDiagVisible > 22) perf_serialize(diag_perf, sizeof(diag_perf));
+    if (diag_scroll + kDiagVisible > 21) perf_serialize(diag_perf, sizeof(diag_perf));
     // Input is sampled by screen_input_tick() every loop iteration, not here.
 
     // 19 characters max (= 113 px, ends at x=118): keeps even the unbounded
